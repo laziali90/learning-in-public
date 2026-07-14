@@ -70,7 +70,7 @@ All notebooks run as a single Databricks Job in sequence:  `UMCC Social data qua
 ## Potential Improvements for the Future
 
 #### Databricks Ingestion & All Data Storage on Company Owned Cloud Environment (Microsoft Azure Postgres SQL Server or similar)
-For simplicity and speed, the original datasets as well as the quality protocol output has been stored on Default Databricks Cloud storage. In order for Company to own the data, a TEAM owned environment would be required (Microsoft Azure or similar) and to overwrite the current default / serverless cloud storage account from Databricks Free edition.
+For simplicity and speed, the original datasets as well as the quality protocol output has been stored on Default Databricks Cloud storage. In order for Company to own the data, a Company owned environment would be required (Microsoft Azure or similar) and to overwrite the current default / serverless cloud storage account from Databricks Free edition.
 
 <img width="535" height="376" alt="image" src="https://github.com/user-attachments/assets/4409ec3a-a7ed-4933-9361-57e387e72c63" />
 
