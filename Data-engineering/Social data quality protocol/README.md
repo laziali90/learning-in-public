@@ -1,6 +1,6 @@
 ## Situation / Issue
 
-In the UMCC Research programme, these datasets play a crucial role in the full season reporting workstream, are substantial in their size (in Excel terms contain 100k's of individual posts and around 40 - 70 columns) and are intended to be used for data analysis and pivoting directly out of the provided excel. Because of the short timeframe between the data delivery and reporting deadlines for UMCC Marketing partners reporting, TEAM Insights responsible was forced to completely trust the data supplier (Kore) to provide a correct dataset.
+In the UMCC Research programme, these datasets play a crucial role in the full season reporting workstream, are substantial in their size (in Excel terms contain 100k's of individual posts and around 40 - 70 columns) and are intended to be used for data analysis and pivoting directly out of the provided excel. Because of the short timeframe between the data delivery and reporting deadlines for UMCC Marketing partners reporting, Company Insights responsible was forced to completely trust the data supplier (Vendor) to provide a correct dataset.
 
 Identified datasets:
 
@@ -11,6 +11,8 @@ Identified datasets:
 - Valuation (UEFA owned and Third parties post monitoring, focus on post by post media valuation of all branded partners)
   - UCL
   - UEL/UECL
+
+> **Disclaimer:** This document has been anonymized. All references to the originating organization, its internal systems, and its data vendor have been replaced with generic placeholders. It is shared purely to illustrate the data pipeline logic and transformation steps — not to disclose any proprietary or organization-specific information.
 
 ---
 
@@ -67,8 +69,8 @@ All notebooks run as a single Databricks Job in sequence:  `UMCC Social data qua
 
 ## Potential Improvements for the Future
 
-#### Databricks Ingestion & All Data Storage on TEAM Owned Cloud Environment (Microsoft Azure Postgres SQL Server or similar)
-For simplicity and speed, the original datasets as well as the quality protocol output has been stored on Default Databricks Cloud storage. In order for TEAM to own the data, a TEAM owned environment would be required (Microsoft Azure or similar) and to overwrite the current default / serverless cloud storage account from Databricks Free edition.
+#### Databricks Ingestion & All Data Storage on Company Owned Cloud Environment (Microsoft Azure Postgres SQL Server or similar)
+For simplicity and speed, the original datasets as well as the quality protocol output has been stored on Default Databricks Cloud storage. In order for Company to own the data, a TEAM owned environment would be required (Microsoft Azure or similar) and to overwrite the current default / serverless cloud storage account from Databricks Free edition.
 
 <img width="535" height="376" alt="image" src="https://github.com/user-attachments/assets/4409ec3a-a7ed-4933-9361-57e387e72c63" />
 
@@ -82,7 +84,7 @@ Reflecting, the 2 notebooks became quite long and include multiple steps. From a
 While lower casing is essential for DIM lookup checks, in the final BI usage, the display of such columns and entries won't look "aesthetically pleasing" whenever connected to a BI solution. One example are the attributes of column `PLATFORM` → Tiktok becomes tiktok etc. Not relevant for now but to consider whenever a similar pipeline with BI connection will be built.
 
 #### Storage Tag for Compliance
-Databricks allows to tag columns so that certain data transformations don't need to be coded / configured manually. Data handled by TEAM currently wouldn't be considered worth being tagged (like GDPR personal information etc.), but definitely a very efficient data cleaning logic if applied consistently in TEAM's future.
+Databricks allows to tag columns so that certain data transformations don't need to be coded / configured manually. Data handled by Company currently wouldn't be considered worth being tagged (like GDPR personal information etc.), but definitely a very efficient data cleaning logic if applied consistently in Company's future.
 
 <img width="660" height="294" alt="image" src="https://github.com/user-attachments/assets/467d0116-1d26-4797-be62-1fee56065ea1" />
 
