@@ -1,5 +1,403 @@
-test
+# DCB Pipeline — Technical Documentation
 
-3.	Data Engineering & Pipeline Design
+Lakeflow Declarative Pipeline covering Landing → Bronze → Silver → Gold for the DCB (Detailed Club Budget) dataset.
 
-Some form of disclaimer, that when it comes 
+---
+
+## Architecture Overview
+
+- **Catalog:** `team`
+- **Landing volume:** `team.landing.dcb` (subfolders: `historical/`, `incremental/`)
+- **Bronze schema:** `team.bronze`
+- **Silver schema:** `team.silver`
+- **Gold schema:** `team.gold`
+- **Dimension schema:** `team.dim`
+- **Orchestration:** single Lakeflow Declarative Pipeline (Python, `pyspark.pipelines` / `dp` API), run on-demand; full DAG (`dcb_raw` → `dcb` → `team.silver.dcb` → `team.gold.dcb`) executes on every run, with streaming/materialized-view engines each determining incremental vs. full recompute internally.
+
+---
+
+## 1. `dcb_raw` (Bronze, stage 1) — Streaming Table
+
+**Purpose:** structural extraction from raw Excel files in landing, no business logic.
+
+- Source: Auto Loader (`cloudFiles`) streaming read from `/Volumes/team/landing/dcb/`, recursively covering both `historical/` and `incremental/` subfolders in a single stream
+- Format: native Databricks Excel reader (`cloudFiles.format = "excel"`, Beta feature, requires DBR 17.1+)
+- Sheet/range targeting: `dataAddress = "Summary!B5:Q100"` — extracts only the `Summary` tab, skips a hidden row and the label column, bounded to the actual data footprint
+- `headerRows = 0` — header row is not trusted from the source file (inconsistent labeling across files, e.g. `TEAM code` vs `TEAM's code` vs double-spaced variants); columns are instead renamed **positionally** via `.toDF(*canonical_names)` against a manually confirmed, fixed 16-column list
+- `cloudFiles.schemaEvolutionMode = "none"` — schema is fixed by design; Excel streaming does not support schema evolution
+- `cloudFiles.schemaLocation` — persisted Auto Loader schema cache; must be manually cleared (along with the checkpoint) whenever the extraction range or column count changes
+- Metadata columns added: `_ingested_at`, `_source_file` (raw `_metadata.file_path`, URL-encoded)
+- `_source_file_decoded` — `%20` sequences replaced with literal spaces, since `_metadata.file_path` returns URL-encoded paths, which silently broke filename-based regex extraction
+- Filename-derived columns extracted via regex against the decoded path, based on a fixed filename taxonomy (`YYYY-MM-DD <COMPETITION> DCB <SEASON>`):
+  - `document_date` (cast to `date`)
+  - `competition`
+  - `season`
+- **Data quality (warn-only expectations):**
+  - `valid_season`: `season != ''`
+  - `valid_competition`: `competition != ''`
+  - `valid_document_date`: `document_date IS NOT NULL`
+  - Note: `regexp_extract` returns `''` (not `NULL`) on non-match, so expectations check against empty string, not null
+
+```python
+from pyspark import pipelines as dp
+from pyspark.sql.functions import (
+    col, current_timestamp, monotonically_increasing_id,
+    last, regexp_extract, regexp_replace, to_date,
+    row_number, concat_ws, lit
+)
+from pyspark.sql import Window
+
+filename_pattern = r"(\d{4}-\d{2}-\d{2}) (\w+) DCB (\d{2}-\d{2})"
+
+canonical_names = [
+    "Budget_category",
+    "UEFA_code",
+    "TEAM_code",
+    "Budget_line",
+    "Responsible",
+    "Updated",
+    "Initial_total_budget_EUR",
+    "Total_budget_Forecast_1_EUR",
+    "Total_budget_Forecast_2_EUR",
+    "Total_budget_Forecast_3_EUR",
+    "Total_budget_Forecast_4_EUR",
+    "Total_budget_last_forecast_EUR",
+    "Total_amount_spent_EUR",
+    "Total_expected_spend_EUR",
+    "Total_remaining_Budget_EUR",
+    "Notes",
+]
+
+numeric_columns = [
+    "Initial_total_budget_EUR",
+    "Total_budget_Forecast_1_EUR",
+    "Total_budget_Forecast_2_EUR",
+    "Total_budget_Forecast_3_EUR",
+    "Total_budget_Forecast_4_EUR",
+    "Total_budget_last_forecast_EUR",
+    "Total_amount_spent_EUR",
+    "Total_expected_spend_EUR",
+    "Total_remaining_Budget_EUR",
+]
+
+
+@dp.table(
+    name="dcb_raw",
+    comment="DCB Summary tab, raw extraction from landing (pre-forward-fill), columns renamed positionally to canonical names, with filename metadata extracted from decoded source path.",
+    table_properties={"quality": "bronze"}
+)
+@dp.expect("valid_season", "season != ''")
+@dp.expect("valid_competition", "competition != ''")
+@dp.expect("valid_document_date", "document_date IS NOT NULL")
+def dcb_raw():
+    df = (
+        spark.readStream
+        .format("cloudFiles")
+        .option("cloudFiles.format", "excel")
+        .option("dataAddress", "Summary!B5:Q100")
+        .option("headerRows", 0)
+        .option("cloudFiles.inferColumnTypes", "true")
+        .option("cloudFiles.schemaLocation", "/Volumes/team/landing/dcb/_schema/")
+        .option("cloudFiles.schemaEvolutionMode", "none")
+        .load("/Volumes/team/landing/dcb/")
+    )
+    df = df.toDF(*canonical_names)
+
+    df = df.withColumn("_ingested_at", current_timestamp())
+    df = df.withColumn("_source_file", col("_metadata.file_path"))
+    df = df.withColumn("_source_file_decoded", regexp_replace(col("_source_file"), "%20", " "))
+
+    df = df.withColumn(
+        "document_date",
+        to_date(regexp_extract(col("_source_file_decoded"), filename_pattern, 1), "yyyy-MM-dd")
+    )
+    df = df.withColumn("competition", regexp_extract(col("_source_file_decoded"), filename_pattern, 2))
+    df = df.withColumn("season", regexp_extract(col("_source_file_decoded"), filename_pattern, 3))
+
+    return df
+
+
+@dp.table(
+    name="dcb",
+    comment="DCB Summary tab: filtered to complete rows (UEFA_code, TEAM_code, Budget_line), Budget_category forward-filled, numeric columns cast, row_id generated.",
+    table_properties={"quality": "bronze"}
+)
+def dcb():
+    df = spark.read.table("dcb_raw")
+    df = df.withColumn("_row_id", monotonically_increasing_id())
+
+    df = df.filter(
+        col("UEFA_code").isNotNull() &
+        col("TEAM_code").isNotNull() &
+        col("Budget_line").isNotNull()
+    )
+
+    w = (Window
+         .partitionBy("_source_file")
+         .orderBy("_row_id")
+         .rowsBetween(Window.unboundedPreceding, 0))
+
+    df = df.withColumn(
+        "Budget_category",
+        last(col("Budget_category"), ignorenulls=True).over(w)
+    )
+
+    for c in numeric_columns:
+        df = df.withColumn(c, col(c).cast("double"))
+
+    row_order_window = Window.partitionBy("_source_file").orderBy("_row_id")
+    df = df.withColumn("_row_number", row_number().over(row_order_window))
+    df = df.withColumn(
+        "row_id",
+        concat_ws("_", lit("dcb"), col("competition"), col("season"), col("_row_number"))
+    )
+
+    return df
+
+```
+
+---
+
+## 2. `dcb` (Bronze, stage 2) — Materialized View
+
+**Purpose:** structural cleanup of Excel-specific artifacts; still no business logic.
+
+- Reads `dcb_raw` as a **batch** source (`spark.read.table`) — required because the forward-fill logic below uses an order-dependent window function, which is unsupported on streaming DataFrames
+- `_row_id` generated via `monotonically_increasing_id()` here (moved out of the streaming stage after hitting `Expression(s): monotonically_increasing_id() is not supported with streaming DataFrames/Datasets`)
+- **Row filtering:** rows dropped where `UEFA_code`, `TEAM_code`, or `Budget_line` is null — removes trailing blank rows within the extraction range and rows without a valid identifying key
+- **Merged-cell forward-fill:** `Budget_category` (a merged Excel column, populated only on the first row of each merge group) is forward-filled using a window function (`last(..., ignorenulls=True)`), partitioned by `_source_file` and ordered by `_row_id`, so fill never bleeds across files
+- **Type correction:** all budget/amount columns explicitly cast to `double` (source inference defaulted to string, only fully resolved after fixing the row-offset issue)
+- **Row ID generation:** composite, human-readable key — `row_id = concat_ws("_", "dcb", competition, season, row_number)` — replacing the initial `monotonically_increasing_id()` long value, using `row_number()` per `_source_file` for a clean sequential counter
+
+
+
+---
+
+## 3. `team.silver.dcb` — Materialized View
+
+**Purpose:** business-relevant column selection and dimensional enrichment.
+
+- Reads `team.bronze.dcb` (fully qualified — cross-schema read within the same pipeline; the `schema=` decorator parameter was attempted first but is not supported in this pipeline runtime, so the table is targeted via fully qualified `name="team.silver.dcb"` instead)
+- Column selection limited to the 5 business-relevant budget fields:
+  - `Budget_category`, `Budget_line`, `Initial_total_budget_EUR`, `Total_budget_last_forecast_EUR`, `Total_expected_spend_EUR`
+- Lineage/traceability columns retained: `season`, `competition`, `document_date`, `_source_file`, `_ingested_at`, `row_id`
+- **Dimensional enrichment:** left join to `team.dim.umccseasoncycle` on `season`, adding `cycle`
+  - Left join (not inner) chosen deliberately so a DCB row is never silently dropped if a season is missing from the DIM table
+- **Data quality (warn-only expectation):** `valid_cycle`: `cycle IS NOT NULL`
+
+```python
+from pyspark import pipelines as dp
+from pyspark.sql.functions import col
+
+@dp.table(
+    name="team.silver.dcb",
+    comment="DCB harmonized to relevant budget columns, enriched with season-cycle mapping from team.dim.seasoncycle.",
+    table_properties={"quality": "silver"}
+)
+@dp.expect("valid_cycle", "cycle IS NOT NULL")
+def dcb_silver():
+    bronze = spark.read.table("team.bronze.dcb")
+    dim = spark.read.table("team.dim.UMCCseasoncycle")
+
+    df = bronze.select(
+        "Budget_category",
+        "Budget_line",
+        "Initial_total_budget_EUR",
+        "Total_budget_last_forecast_EUR",
+        "Total_expected_spend_EUR",
+        "season",
+        "competition",
+        "document_date",
+        "_source_file",
+        "_ingested_at",
+        "row_id",
+    )
+
+    return df.join(dim, on="season", how="left")
+```
+
+---
+
+## 4. `team.dim.umccseasoncycle` — Dimension Table (SQL, static)
+
+**Purpose:** maps every football season to its 3-season reporting cycle.
+
+- Generated via a one-time `CREATE OR REFRESH TABLE ... AS` SQL statement, not a pipeline table
+- Logic: cycles run in consecutive 3-season groups, anchored backward from the most recent complete cycle (`24-25, 25-26, 26-27` → `24-27`), extending back to season `90-91`
+- Static reference data — not expected to change on a regular cadence; lives in the shared `team.dim` schema alongside other project dimension tables
+
+```sql
+CREATE OR REPLACE TABLE team.dim.UMCCseasoncycle AS
+WITH years AS (
+  SELECT explode(sequence(1990, 2026)) AS start_year
+),
+calc AS (
+  SELECT
+    start_year,
+    concat(
+      lpad(CAST(start_year % 100 AS STRING), 2, '0'), '-',
+      lpad(CAST((start_year + 1) % 100 AS STRING), 2, '0')
+    ) AS season,
+    2026 - start_year AS n
+  FROM years
+),
+grouped AS (
+  SELECT
+    season,
+    start_year,
+    floor(n / 3) AS grp
+  FROM calc
+)
+SELECT
+  season,
+  concat(
+    lpad(CAST((2024 - 3 * grp) % 100 AS STRING), 2, '0'), '-',
+    lpad(CAST((2027 - 3 * grp) % 100 AS STRING), 2, '0')
+  ) AS cycle
+FROM grouped
+ORDER BY start_year;
+
+```
+---
+
+## 5. `team.gold.dcb` — Materialized View
+
+**Purpose:** analytics-ready KPI layer.
+
+- Reads `team.silver.dcb`
+- **`budget_accuracy_calc`**: `(Total_expected_spend_EUR / Total_budget_last_forecast_EUR) * 100`, rounded to 2 decimals — continuous metric, calculated for every row
+- **`budget_accuracy_sum`**: categorical label derived from the same ratio (pre-scaling), using closed, non-overlapping bucket boundaries:
+  - `> 1.15` → *significantly overspent*
+  - `> 1.05` and `≤ 1.15` → *overspent*
+  - `≥ 0.95` and `≤ 1.05` → *in budget*
+  - `≥ 0.85` and `< 0.95` → *underspent*
+  - `< 0.85` → *significantly underspent*
+- **`Budget_difference`**: `Total_expected_spend_EUR − Total_budget_last_forecast_EUR`
+- **`Cost_main_category`**: static literal `"Marketing costs"` on every row (placeholder pending a future proper category mapping)
+- **Data quality (warn-only expectation):** `valid_budget_ratio`: `Total_budget_last_forecast_EUR IS NOT NULL AND != 0` — guards the division underlying the two accuracy columns
+
+```python
+
+from pyspark import pipelines as dp
+from pyspark.sql.functions import col, when, round as spark_round, lit
+
+@dp.table(
+    name="team.gold.dcb",
+    comment="DCB gold: budget accuracy metrics, budget difference, and cost category tagging.",
+    table_properties={"quality": "gold"}
+)
+@dp.expect("valid_budget_ratio", "Total_budget_last_forecast_EUR IS NOT NULL AND Total_budget_last_forecast_EUR != 0")
+def dcb_gold():
+    df = spark.read.table("team.silver.dcb")
+
+    ratio = col("Total_expected_spend_EUR") / col("Total_budget_last_forecast_EUR")
+
+    df = df.withColumn("budget_accuracy_calc", spark_round(ratio * 100, 2))
+
+    df = df.withColumn(
+        "budget_accuracy_sum",
+        when(ratio > 1.15, "significantly overspent")
+        .when((ratio > 1.05) & (ratio <= 1.15), "overspent")
+        .when((ratio >= 0.95) & (ratio <= 1.05), "in budget")
+        .when((ratio >= 0.85) & (ratio < 0.95), "underspent")
+        .when(ratio < 0.85, "significantly underspent")
+        .otherwise(None)
+    )
+
+    df = df.withColumn(
+        "Budget_difference",
+        col("Total_expected_spend_EUR") - col("Total_budget_last_forecast_EUR")
+    )
+
+    df = df.withColumn("Cost_main_category", lit("Marketing costs"))
+
+    return df
+from pyspark import pipelines as dp
+from pyspark.sql.functions import col, when, round as spark_round, lit
+
+@dp.table(
+    name="team.gold.dcb",
+    comment="DCB gold: budget accuracy metrics, budget difference, and cost category tagging.",
+    table_properties={"quality": "gold"}
+)
+@dp.expect("valid_budget_ratio", "Total_budget_last_forecast_EUR IS NOT NULL AND Total_budget_last_forecast_EUR != 0")
+def dcb_gold():
+    df = spark.read.table("team.silver.dcb")
+
+    ratio = col("Total_expected_spend_EUR") / col("Total_budget_last_forecast_EUR")
+
+    df = df.withColumn("budget_accuracy_calc", spark_round(ratio * 100, 2))
+
+    df = df.withColumn(
+        "budget_accuracy_sum",
+        when(ratio > 1.15, "significantly overspent")
+        .when((ratio > 1.05) & (ratio <= 1.15), "overspent")
+        .when((ratio >= 0.95) & (ratio <= 1.05), "in budget")
+        .when((ratio >= 0.85) & (ratio < 0.95), "underspent")
+        .when(ratio < 0.85, "significantly underspent")
+        .otherwise(None)
+    )
+
+    df = df.withColumn(
+        "Budget_difference",
+        col("Total_expected_spend_EUR") - col("Total_budget_last_forecast_EUR")
+    )
+
+    df = df.withColumn("Cost_main_category", lit("Marketing costs"))
+
+    return df
+```
+
+---
+
+## CLEANS
+
+### Reset Auto Loader schema and checkpoint state (Python, run in a notebook attached to a cluster):
+Clears the persisted Auto Loader schema inference cache and streaming checkpoint for the dcb landing volume. Required whenever the source extraction logic changes structurally (e.g. cell range, header handling, or column count) — since cloudFiles.schemaEvolutionMode = "none" locks the schema to whatever was inferred on the first run, this cache must be manually cleared before Auto Loader will pick up the new structure.
+
+```python
+dbutils.fs.rm("/Volumes/team/landing/dcb/_schema/", recurse=True)
+dbutils.fs.rm("/Volumes/team/landing/dcb/_checkpoints/", recurse=True)
+```
+
+### Drop bronze DCB tables (SQL, run in the SQL Editor):
+Drops the existing bronze tables so they can be fully rebuilt from a clean state. Run alongside the schema/checkpoint reset above whenever dcb_raw's or dcb's structure changes — without this, the pipeline would attempt to write a new schema into a table still expecting the old one, causing a mismatch error.
+
+```sql
+DROP TABLE IF EXISTS team.bronze.dcb_raw;
+DROP TABLE IF EXISTS team.bronze.dcb;
+```
+
+---
+
+## CHECKS
+
+### Per-file ingestion sense check:
+Shows every distinct source file ingested into dcb_raw so far, with row count and ingestion timestamp, ordered by most recently ingested first. Useful after uploading a new file and running the pipeline — confirms exactly which file was picked up and how many rows it contributed, without digging through the pipeline UI or event log.
+
+```sql
+SELECT
+    _source_file,
+    COUNT(*) AS row_count,
+    MAX(_ingested_at) AS ingested_at
+FROM team.bronze.dcb_raw
+GROUP BY _source_file
+ORDER BY ingested_at DESC;
+```
+
+### Row-count consistency check (raw vs. filtered):
+Compares the total unfiltered row count in dcb_raw against the filtered, forward-filled row count in dcb. Since dcb drops incomplete rows (missing UEFA_code, TEAM_code, or Budget_line), the filtered total should always be less than or equal to the raw total — a quick way to confirm the filtering logic is behaving as expected as new files are added.
+
+```sql
+SELECT COUNT(*) FROM team.bronze.dcb_raw;   -- unfiltered total
+SELECT COUNT(*) FROM team.bronze.dcb;      
+```
+
+---
+
+## Key Technical Decisions / Gotchas
+
+- **Two-stage bronze split (`dcb_raw` / `dcb`)** exists specifically because streaming DataFrames cannot use row-order-dependent window functions or `monotonically_increasing_id()`; any row-order logic must run in a batch stage reading from a streaming table, not inside the streaming table itself.
+- **Schema/checkpoint cache invalidation:** `cloudFiles.schemaLocation` and the Auto Loader checkpoint persist across runs and must be manually cleared (`dbutils.fs.rm(..., recurse=True)`) plus the target tables dropped (`DROP TABLE IF EXISTS`) whenever the source extraction range, header handling, or column count changes — a full pipeline refresh alone does not guarantee this is reset.
+- **Excel header text is not trusted** as a schema source anywhere in this pipeline — headers are inconsistent across files (spacing, apostrophes, casing) and would otherwise fragment into spurious duplicate columns; all naming is positional against a manually verified column list.
+- **File paths from `_metadata.file_path` are URL-encoded** (e.g. spaces → `%20`); any filename-parsing logic must decode first.
