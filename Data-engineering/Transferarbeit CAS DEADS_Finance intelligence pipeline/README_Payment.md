@@ -54,6 +54,7 @@ from urllib.parse import unquote
 
 import pyspark.pipelines as dp
 from pyspark.sql import functions as F
+from pyspark.sql.window import Window
 from pyspark.sql.types import (
     ArrayType,
     DoubleType,
@@ -316,17 +317,43 @@ def total_sheet_partners_raw():
 def total_sheet_partners():
     df = spark.read.table("total_sheet_partners_raw")  # noqa: F821
 
+    # A default row (file_pattern IS NULL) applies to any file; an override
+    # (file_pattern set) applies only where the source path contains it.
+    # Overrides beat defaults, and where several match, the longest pattern
+    # wins as the most specific.
     category_map = spark.read.table("team.bronze.partner_category_map")  # noqa: F821
     category_map = category_map.select(
         F.upper(F.trim(F.col("section_label"))).alias("_map_label"),
+        F.upper(F.trim(F.col("file_pattern"))).alias("_map_file_pattern"),
         F.col("partner_category").alias("_mapped_category"),
-    ).dropDuplicates(["_map_label"])
+    )
 
-    df = df.join(
+    joined = df.join(
         category_map,
-        F.upper(F.trim(F.col("section_label"))) == F.col("_map_label"),
+        (F.upper(F.trim(F.col("section_label"))) == F.col("_map_label"))
+        & (
+            F.col("_map_file_pattern").isNull()
+            | F.upper(F.col("_source_file")).contains(F.col("_map_file_pattern"))
+        ),
         "left",
-    ).withColumnRenamed("_mapped_category", "partner_category").drop("_map_label")
+    )
+
+    # Rank candidates per row: overrides first, then by pattern length
+    # descending. Row 1 is the winner.
+    # added for testing
+    specificity = Window.partitionBy(
+        "_source_file", "_source_sheet", "_sheet_row_number", "partner_name"
+    ).orderBy(
+        F.col("_map_file_pattern").isNull().asc(),
+        F.length(F.col("_map_file_pattern")).desc_nulls_last(),
+    )
+
+    df = (
+        joined.withColumn("_map_rank", F.row_number().over(specificity))
+        .filter(F.col("_map_rank") == 1)
+        .withColumnRenamed("_mapped_category", "partner_category")
+        .drop("_map_label", "_map_file_pattern", "_map_rank")
+    )
 
     return (
         df.withColumn(
