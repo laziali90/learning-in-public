@@ -41,11 +41,12 @@ The Total Sheet settles it: one row per partner, with name and country in **sepa
   * all five money columns (4-8) numeric -> a real partner row
   * money columns hold header **text** instead -> a section header row; its column-1 label is captured verbatim
 - **Columns captured (1-9):** `partner_name`, `partner_country`, `responsible`, `sales_contracted`, `invoiced`, `not_yet_invoiced`, `sales_paid`, `overdue`, `action`. Column 10+ is a currency-conversion helper and is not read
-- **Category resolution:** the verbatim `section_label` is left-joined to `team.bronze.partner_category_map`. Left, never inner - an unmapped label leaves `partner_category` NULL and is flagged, rather than silently removing the partner
-- `partner_key` = filename + `section_label` + `partner_name`. Built from `section_label` rather than `partner_category` deliberately: the label is always present, the category is NULL until mapped, and a key must not depend on reference data that may legitimately be missing
+- **Category resolution** joins the verbatim `section_label` to `team.bronze.partner_category_map`, which carries **defaults and per-file overrides**. A mapping row with `file_pattern IS NULL` is a default applying to every workbook; a row with `file_pattern` set applies only where that string appears (case-insensitively) in the source file path. This exists because the same label genuinely means different things in different files: `PARTNERS` is New Media in UCL 06-07 but Licensees in UEL 13-14, and no single global mapping can express both
+- **Override resolution:** a row may match several mapping entries, so candidates are ranked with a window function - overrides ahead of defaults, then longest `file_pattern` first as the most specific - and only the top-ranked match is kept. `(section_label, file_pattern)` must therefore be unique, which the setup script checks
+- The join is **LEFT, never inner**: an unmapped label leaves `partner_category` NULL and is flagged, rather than silently removing the partner
 - **Data quality (warn-only):** `has_partner_name`, `has_partner_category`, `has_competition`
 
-**Known scope limitation.** The Total Sheet sections are titled *Accounts Receivable*, so a partner contracted but never invoiced can legitimately be absent (confirmed: `Kitbag Ltd`, UCL 13-14 Licensing, contracted 117, invoiced 0). This table is therefore authoritative for **names**, not a complete roster. Such rows are filtered out downstream by the invoice-number rule anyway, and stage 2 carries a warn-only expectation for the case where they are not.
+**Known scope limitation.** The Total Sheet sections are titled *Accounts Receivable*, so a partner contracted but never invoiced can legitimately be absent (confirmed: `Kitbag Ltd`, UCL 13-14 Licensing, contracted 117, invoiced 0). This table is therefore authoritative for **names**, not a complete roster. Most such rows are filtered out downstream by the invoice-number rule anyway; where they are not, stage 2's `has_partner` expectation surfaces them. A small number of rows in UEL 13-14 Licensing remain unresolved on this basis and are treated as a documented exception rather than suppressed.
 
 ```python
 import io
@@ -70,8 +71,7 @@ import openpyxl
 # CONFIG
 # -----------------------------------------------------------------------------
 
-# Same landing volume as the payment pipeline - the dim is derived from the
-# very same workbooks, just a different sheet within them.
+# Same landing volume as the payment pipeline
 LANDING_VOLUME_PATH = "/Volumes/team/landing/payment/"
 
 TOTAL_SHEET_PREFERENCE = ["total sheet (euro)", "total sheet (chf)"]
@@ -340,7 +340,6 @@ def total_sheet_partners():
 
     # Rank candidates per row: overrides first, then by pattern length
     # descending. Row 1 is the winner.
-    # added for testing
     specificity = Window.partitionBy(
         "_source_file", "_source_sheet", "_sheet_row_number", "partner_name"
     ).orderBy(
@@ -411,6 +410,7 @@ def total_sheet_partners():
 - **Whole-file try/except:** one unreadable workbook contributes zero rows instead of failing the stream. A failed streaming table is not committed at all, which previously cascaded into stage 2 failing with `TABLE_OR_VIEW_NOT_FOUND`
 - Extraction: row 6 onward, columns 1-24, every cell stringified. Columns renamed **positionally** (`col_1` ... `col_24`) - source header text is never trusted
 - Metadata: `_source_tab`, `_sheet_row_number` (the true Excel row, captured during parsing rather than reconstructed from explode position), `_source_file` (URL-decoded), `_ingested_at`, `_season_from_filename`
+- - **`_season_from_filename` currently only matches UCL filenames.** The regex is anchored on `UCL`, so UEL workbooks yield NULL for this column. Season and competition are derived properly in stage 0 and stage 2 from a competition-agnostic pattern; this field is a stage-1 convenience and is not what downstream logic relies on
 
 ```python
 import io
