@@ -128,7 +128,6 @@ _decode_udf = F.udf(lambda p: unquote(p) if p else None, StringType())
 
 
 def _clean_str(value):
-    """Trim; treat whitespace-only cells (common in this workbook) as null."""
     if not isinstance(value, str):
         return None
     stripped = value.strip()
@@ -136,16 +135,6 @@ def _clean_str(value):
 
 
 def _parse_total_sheet(content: bytes):
-    """
-    Extract one record per partner from a workbook's Total Sheet.
-
-    Reads both .xlsx (openpyxl) and legacy .xls (xlrd), detected from magic
-    bytes rather than extension - same approach as the payment pipeline's
-    stage 1, since these are the same physical files.
-
-    Wrapped so that a single unreadable workbook contributes no rows rather
-    than failing the stream and leaving the whole table uncommitted.
-    """
     try:
         return _parse_total_sheet_inner(content)
     except Exception:
@@ -466,24 +455,6 @@ _season_udf = F.udf(
 # -----------------------------------------------------------------------------
 
 def _make_category_parser(name_pattern: "re.Pattern"):
-    """
-    Returns a Python UDF that, given the raw bytes of one uploaded
-    workbook, finds every sheet whose name matches name_pattern and
-    extracts each from INTERIM_HEADER_ROW onward, bounded to N_COLS
-    columns - for however many matching sheets that file happens to have.
-
-    Handles both modern .xlsx (zipped XML, read via openpyxl) and legacy
-    .xls (OLE2 compound binary, read via xlrd). These are genuinely
-    different file formats, not just different extensions - openpyxl
-    cannot read .xls at all, and xlrd 2.x deliberately dropped .xlsx
-    support. Format is detected from the file's magic bytes rather than
-    its extension, so a mislabelled file still routes to the right
-    reader.
-
-    Deliberately NOT doing header detection, type casting, or row
-    filtering here - that's row-order-dependent and belongs in bronze
-    stage 2.
-    """
 
     def _parse(content: bytes):
         try:
@@ -720,44 +691,12 @@ COLUMN_TYPES = {
 # -----------------------------------------------------------------------------
 
 def _transform(df, lookup, tab_category: str):
-    """
-    df           - one category's raw table
-    lookup       - team.bronze.total_sheet_partners, the authoritative
-                   per-file list of real partner names
-    tab_category - the category implied by which tab the rows came from,
-                   used ONLY as a tiebreaker where the lookup gives an
-                   ambiguous answer (see below)
-    """
     df = df.withColumn(
         COL_INVOICE,
         F.expr(f"try_cast(regexp_extract(trim({COL_INVOICE}), '^([0-9]+)', 1) as bigint)"),
     )
     df = df.filter(F.col(COL_INVOICE).isNotNull())
 
-    # ------------------------------------------------------------------
-    # Partner resolution, via the Total Sheet lookup
-    #
-    # Column 1 of a detail tab holds a mix of things that all look alike
-    # structurally: the partner's name, a country continuation line
-    # ("Russia" under "NTV Plus"), free-text notes ("8-ung Royalties due
-    # within 30 business Days"), and TOTAL rows. Every previous attempt to
-    # tell them apart from layout alone - blank resp_code, adjacency of
-    # sheet rows, the installment column resetting to "1st" - eventually
-    # misfired on some file, because none of those signals is actually
-    # reliable across 20 years of hand-maintained workbooks.
-    #
-    # total_sheet_partners settles it: it is the definitive list of which
-    # strings in THIS file are real partners. A value that matches is a
-    # partner; a value that does not is noise, whatever it looks like.
-    # Matching is exact (trimmed, case-insensitive) - Total Sheet cells are
-    # formulas referencing these very tabs, so the strings are identical by
-    # construction rather than by luck, and no fuzzy matching is needed or
-    # wanted.
-    #
-    # Scoped to _source_file: names drift between seasons ("British  Sky
-    # BC" with two spaces in one file, one in another), so a lookup entry
-    # only ever applies to rows from the workbook it came from.
-    # ------------------------------------------------------------------
     lookup_by_name = (
         lookup.groupBy(
             F.col("_source_file").alias("_lk_file"),
@@ -867,34 +806,6 @@ def _transform(df, lookup, tab_category: str):
         *rename_exprs,
     )
 
-
-# -----------------------------------------------------------------------------
-# Table definitions - one per category, literal table names throughout
-#
-# All expectations here are warn-only (@dp.expect, never
-# @dp.expect_or_drop): invoice_number is the sole criterion for whether a
-# row counts as real data, so nothing is removed on the strength of a
-# partner lookup.
-#
-# has_partner - a row with a valid invoice number that resolved no partner
-#   at all. Expected to be 0. Non-zero means a file's very first data rows
-#   sit above any name the Total Sheet knows about, OR a genuine partner is
-#   missing from the Total Sheet entirely while still having invoiced rows.
-#   The second case matters: those payments would inherit the PRECEDING
-#   partner's name rather than their own, which is silent misattribution.
-#   Confirmed to exist in principle - "Kitbag Ltd" (UCL 13-14 Licensing) is
-#   a real partner absent from the Total Sheet because it was contracted
-#   but never invoiced. That particular row is filtered out anyway by the
-#   invoice_number rule, but a partner missing for some other reason would
-#   not be, so this expectation is the guard.
-#
-# category_not_from_tab_fallback - the lookup found the name under two
-#   different categories in the same file and could not decide, so the
-#   tab's own category was used. Confirmed cases: "ESPN" (broadcaster and
-#   licensee), "adidas" (licensee and supplier) in UCL 2010-2011. A small
-#   non-zero count is normal; a large one would suggest the taxonomy in
-#   partner_category_map has drifted from the tab literals below.
-# -----------------------------------------------------------------------------
 
 @dp.table(
     name="tv_payments",
