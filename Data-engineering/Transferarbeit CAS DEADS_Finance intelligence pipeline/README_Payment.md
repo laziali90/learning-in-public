@@ -48,44 +48,6 @@ The Total Sheet settles it: one row per partner, with name and country in **sepa
 **Known scope limitation.** The Total Sheet sections are titled *Accounts Receivable*, so a partner contracted but never invoiced can legitimately be absent (confirmed: `Kitbag Ltd`, UCL 13-14 Licensing, contracted 117, invoiced 0). This table is therefore authoritative for **names**, not a complete roster. Such rows are filtered out downstream by the invoice-number rule anyway, and stage 2 carries a warn-only expectation for the case where they are not.
 
 ```python
-# =============================================================================
-# Bronze stage 0 - total_sheet_partners, parsed from each workbook's Total Sheet
-# Dataset: Payment (TV / Sponsor / Suppliers / Licensing)
-#
-# Runs FIRST, before the detail-tab stages: stage 2 resolves partner names
-# against this table, so it must exist before those tables are built.
-#
-# Deliberately NOT called a "dim". A dimension table implies a conformed,
-# deduplicated entity shared across facts. This is a per-file lookup whose
-# rows are only valid within the workbook they came from - the name says
-# exactly what it is: the partner rows of a Total Sheet.
-#
-# WHY THIS EXISTS
-# The detail tabs (TV/Sponsor/Licensing PAYMENTS) split a partner's name
-# across two physical rows ("NTV Plus" / "Russia"), and interleave notes,
-# location lines, and TOTAL rows that look structurally identical to a
-# partner row. Any rule that infers "is this a partner name?" from layout
-# alone (blank resp_code, row adjacency, installment labels) eventually
-# misfires - e.g. a note line like "8-ung Royalties due within 30 business
-# Days" sitting where a location line would be.
-#
-# The Total Sheet solves this: it lists one row per partner, with name and
-# country in SEPARATE columns, and its cells are formulas referencing the
-# detail tabs - so the names are identical by construction, not by
-# coincidence. Verified on real files: every Total Sheet name exact-matches
-# a detail tab name (no fuzzy matching required, and none is done here).
-#
-# SCOPE / KNOWN LIMITATION
-# The Total Sheet sections are titled "Accounts Receivable", so a partner
-# with a contract but nothing invoiced can legitimately be absent from it
-# (confirmed: "Kitbag Ltd" in UCL 13-14 Licensing, contracted 117,
-# invoiced 0). Such partners are also filtered out downstream by the
-# invoice_number rule in bronze stage 2, so this is consistent - but it
-# does mean this dim is authoritative for NAMES, not a complete roster.
-# Bronze stage 2 carries a warn-only expectation for detail rows whose
-# name is absent here, so the assumption stays verified rather than blind.
-# =============================================================================
-
 import io
 import re
 from urllib.parse import unquote
@@ -111,18 +73,8 @@ import openpyxl
 # very same workbooks, just a different sheet within them.
 LANDING_VOLUME_PATH = "/Volumes/team/landing/payment/"
 
-# A workbook may carry "Total Sheet (Euro)", "Total Sheet (CHF)", or both.
-# They hold the same partner roster in different reporting currencies, so
-# exactly one is used. Euro is preferred when present purely for
-# determinism (so a file with both always yields the same rows); the CHF
-# sheet is the fallback when Euro is absent.
 TOTAL_SHEET_PREFERENCE = ["total sheet (euro)", "total sheet (chf)"]
 
-# Column layout of the Total Sheet, 1-indexed. Confirmed against the
-# header row, which reads: BROADCASTERS | (country) | Respon-sible |
-# Sales contracted/agreed | Invoiced | not yet invoiced | Sales paid |
-# Overdue | Action. Columns 10+ are out of scope (a currency-conversion
-# helper) and are not read.
 COL_PARTNER_NAME = 1
 COL_PARTNER_COUNTRY = 2
 COL_RESPONSIBLE = 3
@@ -144,22 +96,7 @@ NUMERIC_COLS = (
     COL_OVERDUE,
 )
 
-# Section header rows are identified structurally, NOT by matching a known
-# list of labels: a header row has text in column 1 while the money columns
-# (which a real partner row fills with numbers) hold header TEXT instead.
-# That test is layout-based and so cannot miss a section just because its
-# wording is new.
-#
-# The label itself is captured verbatim and resolved to a canonical
-# category later, by joining to team.bronze.partner_category_map. Labels
-# vary across workbooks ("SPONSOR" vs "SPONSORS", "Licensee" vs
-# "Licensees", and older files may use wording not yet seen), so an
-# unrecognised label must never cause its partners to be dropped here.
 
-# The Total Sheet ends with a "2. Accounts Receivable Overview" section:
-# a summary-of-summaries whose rows ("Sponsors", "Licensees", "TOTAL")
-# pass the numeric test but are aggregates, not partners. Parsing stops
-# there. The partner sections are the "3.x" ones above it.
 OVERVIEW_SECTION_PATTERN = re.compile(r"^\s*2\.")
 
 # Competition + season from the file path, matching the payment pipeline's
@@ -297,13 +234,6 @@ def _parse_total_sheet_inner(content: bytes):
         is_partner_row = all(isinstance(v, (int, float)) for v in numbers)
 
         if not is_partner_row:
-            # Text in column 1 but no numbers in the money columns. This is
-            # a section header row - the money columns hold the header text
-            # ("contracted/", "Invoiced", ...). Capture its label verbatim;
-            # it is resolved to a category downstream via the mapping table.
-            # Spacers, notes and the exchange-rate row also land here, but
-            # they are harmless: the next real header row overwrites this,
-            # and a stray value only ever appears as an unmapped label.
             header_text = [get(r, c) for c in NUMERIC_COLS]
             looks_like_header = any(isinstance(v, str) and v.strip() for v in header_text)
             if looks_like_header:
@@ -391,26 +321,12 @@ def total_sheet_partners_raw():
         "another), so this is never deduplicated across files."
     ),
 )
-# has_partner_category is warn-only, and is the signal that a Total Sheet
-# used a section label not yet present in team.bronze.partner_category_map.
-# The affected partners are still written, with a NULL category - they are
-# never dropped over a missing mapping. When this shows unmet rows, run
-# query_unmapped_section_labels.sql to list the labels to add.
 @dp.expect("has_partner_name", "partner_name IS NOT NULL")
 @dp.expect("has_partner_category", "partner_category IS NOT NULL")
 @dp.expect("has_competition", "competition IS NOT NULL AND competition <> ''")
 def total_sheet_partners():
     df = spark.read.table("total_sheet_partners_raw")  # noqa: F821
 
-    # Resolve the verbatim section label to a canonical category via the
-    # hand-maintained mapping table. Fully qualified because this is
-    # reference data OUTSIDE the pipeline (created once in SQL, never
-    # written by the pipeline), which is exactly the case where a static
-    # external read is correct - unlike reads of pipeline-owned tables,
-    # which must use short names to register a dependency.
-    #
-    # LEFT join, never inner: an unmapped label must leave partner_category
-    # NULL and be flagged, not silently remove the partner from the table.
     category_map = spark.read.table("team.bronze.partner_category_map")  # noqa: F821
     category_map = category_map.select(
         F.upper(F.trim(F.col("section_label"))).alias("_map_label"),
@@ -423,10 +339,6 @@ def total_sheet_partners():
         "left",
     ).withColumnRenamed("_mapped_category", "partner_category").drop("_map_label")
 
-    # partner_key is scoped to the source file on purpose. A partner's name,
-    # country, or responsible code can legitimately differ between seasons,
-    # and the whole point of this lookup is to match the detail tabs of the
-    # SAME workbook - so it must never be deduplicated across files.
     return (
         df.withColumn(
             "competition",
@@ -438,10 +350,6 @@ def total_sheet_partners():
         )
         .withColumn(
             "partner_key",
-            # Built from section_label, not partner_category: the label is
-            # always present, whereas the category is NULL until its label
-            # is mapped - a key must not depend on reference data that may
-            # legitimately be missing.
             F.concat_ws(
                 "|",
                 F.regexp_extract(F.col("_source_file"), r"([^/]+)\.[Xx][Ll][Ss][Xx]?$", 1),
@@ -489,22 +397,6 @@ def total_sheet_partners():
 - Metadata: `_source_tab`, `_sheet_row_number` (the true Excel row, captured during parsing rather than reconstructed from explode position), `_source_file` (URL-decoded), `_ingested_at`, `_season_from_filename`
 
 ```python
-# =============================================================================
-# Bronze stage 1 - <category>_raw streaming tables
-# Dataset: Payment (TV / Sponsor / Licensing)
-#
-# Tabs are matched dynamically by NAME PATTERN, not a fixed literal list - 
-# per the original brief ("select tabs that have 'TV Payment' in its
-# name"). A file may contribute 0, 1, or several matching tabs per
-# category (this sample has 2 TV tabs: EU and EX); all of them flow into
-# the same category-level raw table, tagged with the originating tab name
-# (_source_tab) so nothing is lost.
-#
-# Pattern: mirrors the DCB sibling pipeline. Pure structural extraction only
-# - row-order-dependent logic (real header detection, casting, null
-# filtering) is deliberately deferred to bronze stage 2 (materialized view).
-# =============================================================================
-
 import io
 import re
 from urllib.parse import unquote
@@ -525,10 +417,6 @@ import openpyxl
 # CONFIG - confirm / adjust before first run
 # -----------------------------------------------------------------------------
 
-# Unity Catalog Volume path for the Payment landing zone. Points at the
-# parent folder so Auto Loader's recursive directory listing picks up
-# both historical/ and incremental/ without a code change when the
-# SharePoint connector starts landing files in incremental/.
 LANDING_VOLUME_PATH = "/Volumes/team/landing/payment/"
 
 # Row 6 is the interim header in every source tab. Rows 1-5 are
@@ -540,12 +428,6 @@ N_COLS = 24  # capped: confirmed identical business meaning across every
              # once cross-checked against each tab's detail block. Columns
              # 25+ are out of scope entirely.
 
-# One entry per CATEGORY, not per literal tab name. `pattern` is a
-# case-insensitive substring match against every sheet name in the
-# workbook - any sheet matching gets pulled into this category's raw
-# table, whatever the file's actual tab count/naming happens to be for
-# that season (this sample has 2 TV tabs; a future file might have 1, or
-# a differently-named split).
 CATEGORY_CONFIGS = [
     {"raw_table": "tv_payments_raw", "pattern": re.compile(r"tv\s*payment", re.IGNORECASE)},
     {"raw_table": "sponsor_payments_raw", "pattern": re.compile(r"sponsor\s*payment", re.IGNORECASE)},
@@ -559,11 +441,6 @@ FILENAME_METADATA_PATTERN = re.compile(
     r"UCL[ _](?P<season>\d{2,4}-\d{2,4})[ _]Payments", re.IGNORECASE
 )
 
-# Struct returned by the per-file parser UDF: one entry per extracted row,
-# each carrying its originating tab name and true Excel row number
-# (captured directly during parsing, not reconstructed after the fact - 
-# reconstructing from explode position would silently drift if any row in
-# between happened to be fully blank and got skipped).
 ROW_STRUCT = StructType(
     [
         StructField("sheet_name", StringType(), nullable=False),
@@ -612,36 +489,16 @@ def _make_category_parser(name_pattern: "re.Pattern"):
         try:
             return _parse_inner(content)
         except Exception:
-            # One unreadable file must not take down ingestion for every
-            # other file in the volume. A streaming table that fails is
-            # not committed at all, so a single corrupt/unsupported/
-            # password-protected workbook would otherwise leave the raw
-            # table missing entirely and cascade into stage 2 failing
-            # with TABLE_OR_VIEW_NOT_FOUND. Skipping the file instead
-            # means it contributes no rows and shows up as absent from
-            # the per-_source_file counts, which is diagnosable, while
-            # everything else still lands.
             return {"rows": []}
 
     def _parse_inner(content: bytes):
         if content is None:
             return {"rows": []}
 
-        # Magic bytes: .xlsx is a ZIP archive ("PK\x03\x04"); .xls is an
-        # OLE2 compound document ("\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1").
-        # Coerced to bytes defensively, since Spark can hand binary
-        # columns over as bytearray/memoryview depending on the
-        # execution path.
         head = bytes(content[:8])
         is_xls = head == b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
         is_xlsx = head[:4] == b"PK\x03\x04"
 
-        # Files matching neither signature are skipped rather than being
-        # passed to openpyxl as a fallback. A file whose extension says
-        # .xls but whose contents are something else entirely (common
-        # with decades-old exports - a renamed CSV, HTML table, or a
-        # truncated file) would otherwise reach openpyxl, fail with
-        # BadZipFile, and take down the whole stream on one bad file.
         if not is_xls and not is_xlsx:
             return {"rows": []}
 
@@ -663,22 +520,11 @@ def _make_category_parser(name_pattern: "re.Pattern"):
                         if c0 < sheet.ncols:
                             cell = sheet.cell(r0, c0)
                             v = cell.value
-                            # xlrd returns dates as floats with a separate
-                            # type flag; convert to a datetime so the
-                            # stringified form matches what openpyxl
-                            # produces and stage 2's date casts still work.
                             if cell.ctype == xlrd.XL_CELL_DATE:
                                 v = xlrd.xldate_as_datetime(v, book.datemode)
                             elif cell.ctype == xlrd.XL_CELL_EMPTY:
                                 v = None
                             elif cell.ctype == xlrd.XL_CELL_NUMBER:
-                                # xlrd returns every number as a float, so
-                                # whole numbers arrive as e.g. 12345.0 while
-                                # openpyxl gives 12345. Normalise to int
-                                # where the value is integral, so both
-                                # readers produce identical strings and
-                                # stage 2 sees consistent input regardless
-                                # of source format.
                                 if v == int(v):
                                     v = int(v)
                         else:
@@ -740,10 +586,6 @@ def _build_raw_table(raw_table: str, name_pattern: "re.Pattern"):
         raw = (
             spark.readStream.format("cloudFiles")
             .option("cloudFiles.format", "binaryFile")
-            # Matches both modern .xlsx and legacy .xls (some source
-            # files are ~20 years old and cannot be re-saved). The
-            # parser UDF detects which format each file actually is from
-            # its magic bytes and routes to the right reader.
             .option("pathGlobFilter", "*.xls*")
             .load(LANDING_VOLUME_PATH)
         )
@@ -804,59 +646,10 @@ for cfg in CATEGORY_CONFIGS:
 **Column naming caveat.** Names are hardcoded rather than derived, and two of them contradict their own header text: column 6 (`Invoiced`) holds an invoicing **date**, and column 8 (labelled `not yet invoiced` at row 6) holds a **due date**. Both were confirmed against the detail block headers and the actual surviving data, not the interim header row.
 
 ```python
-# =============================================================================
-# Bronze stage 2 - <name> materialized views, batch read from <category>_raw
-# Dataset: Payment (TV / Sponsor / Licensing)
-#
-# Row-order-dependent logic lives here (not in the streaming _raw stage):
-# - cleaning + type casting Invoice (strip to leading digit run before
-#     try_cast, so a value like "112858/882" doesn't get nulled/dropped
-#     entirely just because of a slash)
-# - dropping non-data rows (the interim header band, repeated header
-#     blocks, Total rows, blank separators, and the entire pre-detail
-#     "summary" section) via a single filter on invoice_number, which is
-#     the one reliable signal for "is this row real data at all"
-# - resolving partner names against total_sheet_partners, per source
-#     file, and forward-filling them down each partner's block
-# - taking partner_category from that same lookup rather than from which
-#     tab the rows came from - the Total Sheet has the better context
-# - applying a hardcoded column-name list AND explicit types (the layout
-#     is known and stable, confirmed against the detail block + real
-#     data, not just row 6/7 - see COLUMN_NAMES / COLUMN_TYPES below)
-# - a human-readable row id
-#
-# IMPORTANT partitioning note: a single _source_file can contain more than
-# one matching tab for the same category (this sample has 2 TV tabs: EU
-# and EX, both landing in tv_payments_raw). Their _sheet_row_number values
-# legitimately overlap *within the same file* - row 6 exists in both. Every
-# window function below therefore partitions by (_source_file, _source_tab)
-# together, not _source_file alone, or EU/EX rows would bleed into the
-# same forward-fill blocks.
-#
-# Table definitions below are written out explicitly, one function per
-# table, using each source table's SHORT name (e.g. "tv_payments_raw"),
-# not a fully-qualified "team.bronze.tv_payments_raw". A fully-qualified
-# read is treated by Lakeflow as a static external snapshot - no
-# dependency edge gets added to the pipeline graph, and on a fresh run it
-# fails outright since nothing has been built yet. A short name tells
-# Lakeflow the table is produced by this same pipeline, which is what
-# establishes the stage 1 -> stage 2 execution order. Fully-qualified
-# names are reserved for genuine cross-schema targets (see silver, which
-# will need "team.bronze.payment" to read out of this schema).
-# =============================================================================
-
 from pyspark.sql import functions as F
 from pyspark.sql.window import Window
 import pyspark.pipelines as dp
 
-# Competition code from the original file path, e.g. "UCL" out of
-# ".../UCL 2010-2011 Payments.xlsx" or ".../UCL 17-18 Payments.xlsx".
-# Not anchored to the start of the string, since _source_file is a full
-# path. Matches the leading alphabetic token immediately preceding a
-# "<season> Payments" pattern - generalized beyond a hardcoded "UCL"
-# literal so a future competition doesn't require a code change here.
-# Moved here (from stage 3) so stage 3 can be a pure union with no
-# per-row computation of its own.
 COMPETITION_PATTERN = r"([A-Za-z]+)[ _]\d{2,4}-\d{2,4}[ _]Payments"
 
 # -----------------------------------------------------------------------------
@@ -900,19 +693,9 @@ COLUMN_NAMES = [
 ]
 assert len(COLUMN_NAMES) == N_COLS
 
-# Explicit type casting, position 1-24. Columns 1/2/7 are excluded here -
-# they're handled separately (partner/resp_code are the block-filled
-# strings, already correct type; invoice_number is cleaned/cast earlier).
-# Every other column gets try_cast (not cast) so a genuinely malformed
-# value nulls out rather than failing the whole table.
 COLUMN_TYPES = {
     5: "double",           # sales_contracted_original
     6: "date",              # invoiced_original - date of invoicing, not
-                             #     an amount (confirmed 100% date-typed
-                             #     among rows that survive the invoice
-                             #     filter; header text "Invoiced" is
-                             #     misleading the same way "not yet
-                             #     invoiced" misled column 8)
     8: "date",              # due_on
     9: "date",              # receipt_of_payment
     10: "double",           # sales_paid_original
@@ -945,16 +728,6 @@ def _transform(df, lookup, tab_category: str):
                    used ONLY as a tiebreaker where the lookup gives an
                    ambiguous answer (see below)
     """
-    # Clean invoice numbers before casting: a handful of values contain a
-    # slash (e.g. "112858/882" - two combined invoice numbers). Keep the
-    # leading digit run and cast that, rather than nulling the whole value
-    # out. Genuine junk (header text, blanks, "Total") has no leading
-    # digits, so it still resolves to null.
-    #
-    # No explicit header-band drop is needed: row 6 holds "Invoice" or
-    # nothing in this column and row 7 holds "Number" or nothing, so the
-    # filter below removes them as a side effect, along with Total rows,
-    # repeated mid-sheet headers, and the whole summary section.
     df = df.withColumn(
         COL_INVOICE,
         F.expr(f"try_cast(regexp_extract(trim({COL_INVOICE}), '^([0-9]+)', 1) as bigint)"),
@@ -991,12 +764,6 @@ def _transform(df, lookup, tab_category: str):
             F.upper(F.trim(F.col("partner_name"))).alias("_lk_name"),
         )
         .agg(
-            # collect_set, not first(): a name can legitimately appear
-            # several times in one Total Sheet - a broadcaster with
-            # contracts in both the Europe and Ex-Europe sections, for
-            # instance. Reducing to the DISTINCT set of categories keeps
-            # this strictly one row per (file, name), so the join below
-            # cannot fan out and silently multiply payment rows.
             F.collect_set(F.col("partner_category")).alias("_lk_categories"),
             F.first(F.col("partner_name"), ignorenulls=True).alias("_lk_canonical_name"),
         )
@@ -1019,14 +786,6 @@ def _transform(df, lookup, tab_category: str):
         F.when(matched, F.col("_lk_canonical_name")).otherwise(F.lit(None).cast("string")),
     )
 
-    # Category comes from the Total Sheet, not from which tab the row was
-    # read out of - the Total Sheet has the better context (it separates
-    # suppliers from sponsors, which the tab names do not). The tab's own
-    # category is used only to break a genuine tie: a handful of names are
-    # listed under two different categories in the same file (confirmed:
-    # "ESPN" as both broadcaster and licensee, "adidas" as both licensee
-    # and supplier, in UCL 2010-2011). There the lookup cannot say which
-    # one this row is, so the tab - which does know - decides.
     df = df.withColumn(
         "_category_seed",
         F.when(~matched, F.lit(None).cast("string"))
@@ -1043,10 +802,6 @@ def _transform(df, lookup, tab_category: str):
 
     df = df.drop("_lk_file", "_lk_name", "_lk_categories", "_lk_canonical_name")
 
-    # Block id: increments on each row that seeded a real partner. Every
-    # row until the next seed belongs to that partner's block. This is the
-    # same running-sum fill as before; only the definition of "what starts
-    # a block" has changed - from a layout guess to a lookup match.
     order_win = Window.partitionBy("_source_file", "_source_tab").orderBy("_sheet_row_number")
     block_start = F.when(F.col("_partner_seed").isNotNull(), 1).otherwise(0)
     df = df.withColumn(
@@ -1082,10 +837,6 @@ def _transform(df, lookup, tab_category: str):
         F.regexp_extract(F.col("_source_file"), COMPETITION_PATTERN, 1),
     )
 
-    # Apply the hardcoded names. col_1/col_2 are superseded by the
-    # block-filled partner/resp_code above; col_7 (Invoice) gets the
-    # fixed name "invoice_number" regardless of what COLUMN_NAMES says
-    # at that position - it's already been cleaned/cast above.
     rename_exprs = []
     for i in range(N_COLS):
         raw_col = f"col_{i + 1}"
@@ -1201,40 +952,6 @@ def licensing_payments():
 - **Data quality (warn-only):** `has_partner`, `has_invoice_number` - both already guaranteed upstream, declared again here as defence in depth against the union itself, and so that anyone monitoring `payment` directly need not trace back through three separate tables
 
 ```python
-# =============================================================================
-# Bronze stage 3 - harmonize into one "payment" table
-# Dataset: Payment (TV / Sponsor / Licensing)
-#
-# Mirrors the DCB pattern: don't leave separate category-level tables as
-# the final bronze output - union them into one table once each has been
-# cleaned/typed individually in stage 2. Downstream (silver) reads from
-# this single "payment" table.
-#
-# Pure union, plus two warn-only quality checks on the deliverable table
-# itself. partner_category and competition are both already columns on
-# each stage-2 table (fixed per category-level pipeline definition, and
-# derived from _source_file respectively - see stage 2). No per-row data
-# manipulation happens in this file.
-#
-# has_partner / has_invoice_number: both are already guaranteed by stage
-# 2 (invoice_number via a hard filter, partner via its own warn-only
-# check) - so these are not expected to ever fail. They're declared here
-# anyway, on the actual "payment" table people query, for two reasons:
-# (1) defense in depth against the union itself ever silently
-# misaligning columns despite the strict unionByName below, and (2)
-# visibility exactly where it's useful - someone monitoring "payment"
-# directly shouldn't have to trace back through three separate
-# category-level tables to see this signal.
-#
-# Reads use each source table's SHORT name (e.g. "tv_payments"), not a
-# fully-qualified "team.bronze.tv_payments". A fully-qualified read is
-# treated by Lakeflow as a static external snapshot - no dependency edge
-# gets added to the pipeline graph, and on a fresh run it fails outright
-# since nothing has been built yet. A short name tells Lakeflow the table
-# is produced by this same pipeline, which is what establishes stage 2 ->
-# stage 3 execution order.
-# =============================================================================
-
 import pyspark.pipelines as dp
 
 
@@ -1253,10 +970,6 @@ def payment():
     sponsor = spark.read.table("sponsor_payments")  # noqa: F821
     licensing = spark.read.table("licensing_payments")  # noqa: F821
 
-    # unionByName (default: strict column match) is deliberate - if a
-    # future edit to one of the 3 stage-2 tables drifts from the shared
-    # hardcoded schema, this fails loudly here rather than silently
-    # producing a table with nulls/misaligned columns.
     return tv.unionByName(sponsor).unionByName(licensing)
 ```
 
