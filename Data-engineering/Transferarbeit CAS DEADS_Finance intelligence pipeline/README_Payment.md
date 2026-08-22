@@ -915,6 +915,87 @@ def payment():
     return tv.unionByName(sponsor).unionByName(licensing)
 ```
 
+## 4. payment (Silver) - Materialized View
+
+Purpose: trim bronze.payment to business-relevant columns and enrich with a cleaned, cross-season partner name.
+
+- Column trim: drops 20 columns (lineage detail, original-currency and CHF blocks, rate columns) down to 13 - the business columns plus `_source_file`, `_ingested_at`, `_season_from_filename`. EUR figures only.
+- `partner_cleaned` is added via a left join to `team.dim.umcc_partners` - a hand-maintained dimension, never written by the pipeline, read fully-qualified (same convention as `team.bronze.partner_category_map`). See `CREATE_payment_silver_DIM_umcc_partner.sql` for its DDL and data.
+- The join compares an apostrophe-stripped version of `partner` on both sides, not the raw column directly. Confirmed case: `"Beijing XIN'AI Sports"` failed to match on an apostrophe-related mismatch; stripping it from both sides at join time (without altering either stored value) fixes that and any future name with the same issue.
+- `umcc_partners` grain is `partner` alone, not `(partner, partner_category)`. Manual review of the full partner list confirmed no raw name maps to more than one `partner_cleaned` value, including names that legitimately span multiple categories (e.g. `adidas` as SPONSOR/SUPPLIER/LICENSEE all clean to the same name).
+- Left join, never inner: an unmatched partner keeps its row with `partner_cleaned = NULL` rather than being dropped.
+- `partner_country` was considered (live join to `total_sheet_partners`, scoped by `(partner, _source_file)`) and deliberately dropped - added no value on top of `partner_category`/`partner_cleaned` for this table.
+- Data quality (warn-only): `has_invoice_number`, `has_partner_cleaned` - the latter is the signal to extend `umcc_partners`.
+- Companion table `umcc_partners_quality_check`: a standalone read of `team.dim.umcc_partners` grouped by `partner`, flagging any raw value that appears more than once in the dim (which would fan out the join above).
+
+```python
+"""Silver transformation: team.silver.payment"""
+
+import pyspark.pipelines as dp
+from pyspark.sql import functions as F
+
+SILVER_PAYMENT_COLUMNS = [
+    "partner",
+    "partner_category",
+    "competition",
+    "invoice_number",
+    "invoiced_original",
+    "due_on",
+    "receipt_of_payment",
+    "sales_contracted_eur",
+    "invoiced_eur",
+    "sales_paid_eur",
+    "_source_file",
+    "_ingested_at",
+    "_season_from_filename",
+]
+
+
+def _strip_apostrophe(col):
+    return F.regexp_replace(col, "'", "")
+
+
+@dp.table(
+    name="team.silver.payment",
+    comment=(
+        "Bronze payment trimmed to business-relevant columns, enriched with "
+        "partner_cleaned from the hand-maintained team.dim.umcc_partners."
+    ),
+)
+@dp.expect("has_invoice_number", "invoice_number IS NOT NULL")
+@dp.expect("has_partner_cleaned", "partner_cleaned IS NOT NULL")
+def payment():
+    bronze_payment = spark.read.table("payment").select(*SILVER_PAYMENT_COLUMNS)
+    bronze_payment = bronze_payment.withColumn(
+        "_join_key", _strip_apostrophe(F.col("partner"))
+    )
+
+    umcc_partners_dim = spark.read.table("team.dim.umcc_partners").select(
+        _strip_apostrophe(F.col("partner")).alias("_join_key"),
+        "partner_cleaned",
+    )
+
+    return bronze_payment.join(
+        umcc_partners_dim, on="_join_key", how="left"
+    ).drop("_join_key")
+
+
+@dp.table(
+    name="team.silver.umcc_partners_quality_check",
+    comment=(
+        "Uniqueness check over team.dim.umcc_partners - flags duplicate "
+        "partner values before they fan out the silver.payment join."
+    ),
+)
+@dp.expect("partner_unique_in_dim", "match_count = 1")
+def umcc_partners_quality_check():
+    return (
+        spark.read.table("team.dim.umcc_partners")
+        .groupBy("partner")
+        .agg(F.count("*").alias("match_count"))
+    )
+```
+
 ---
 
 ## Key Technical Decisions / Gotchas
