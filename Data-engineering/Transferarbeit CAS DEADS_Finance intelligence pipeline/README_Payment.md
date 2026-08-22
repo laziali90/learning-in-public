@@ -410,7 +410,6 @@ def total_sheet_partners():
 - **Whole-file try/except:** one unreadable workbook contributes zero rows instead of failing the stream. A failed streaming table is not committed at all, which previously cascaded into stage 2 failing with `TABLE_OR_VIEW_NOT_FOUND`
 - Extraction: row 6 onward, columns 1-24, every cell stringified. Columns renamed **positionally** (`col_1` ... `col_24`) - source header text is never trusted
 - Metadata: `_source_tab`, `_sheet_row_number` (the true Excel row, captured during parsing rather than reconstructed from explode position), `_source_file` (URL-decoded), `_ingested_at`, `_season_from_filename`
-- - **`_season_from_filename` currently only matches UCL filenames.** The regex is anchored on `UCL`, so UEL workbooks yield NULL for this column. Season and competition are derived properly in stage 0 and stage 2 from a competition-agnostic pattern; this field is a stage-1 convenience and is not what downstream logic relies on
 
 ```python
 import io
