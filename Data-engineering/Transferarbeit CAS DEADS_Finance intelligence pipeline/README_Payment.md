@@ -450,11 +450,16 @@ CATEGORY_CONFIGS = [
     {"raw_table": "licensing_payments_raw", "pattern": re.compile(r"licensing\s*payment", re.IGNORECASE)},
 ]
 
-# Filename -> season metadata. Confirmed against real filenames:
+# Filename -> season metadata. Competition prefix is intentionally
+# generic ([A-Za-z]+), not hardcoded to UCL, so this keeps working
+# as new competitions are added (e.g. UECL) without another code
+# change - same approach already used by COMPETITION_PATTERN in the
+# stage-2 transform file. Confirmed against real filenames:
 #   "UCL 2010-2011 Payments.xlsx", "UCL 17-18 Payments.xlsx",
-#   "UCL 24-25 Payments.xlsx", "UCL 06-07 Payments - NHU.xlsx"
+#   "UCL 24-25 Payments.xlsx", "UCL 06-07 Payments - NHU.xlsx",
+#   "UEL 13-14 Payments.xlsx", "UEL 21-22 Payments.xlsx"
 FILENAME_METADATA_PATTERN = re.compile(
-    r"UCL[ _](?P<season>\d{2,4}-\d{2,4})[ _]Payments", re.IGNORECASE
+    r"[A-Za-z]+[ _](?P<season>\d{2,4}-\d{2,4})[ _]Payments", re.IGNORECASE
 )
 
 ROW_STRUCT = StructType(
