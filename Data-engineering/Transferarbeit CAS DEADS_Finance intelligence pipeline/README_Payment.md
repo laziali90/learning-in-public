@@ -1046,6 +1046,12 @@ def payment():
     for old, new in RENAMES.items():
         df = df.withColumnRenamed(old, new)
 
+  # Enrich with UMCC season-cycle reference data. Single-name join on
+    # "Season" relies on Spark's case-insensitive column resolution to
+    # match against the dim's "season" column with no duplicate key column.
+    season_cycle = spark.read.table("team.dim.umccseasoncycle").select("season", "cycle")
+    df = df.join(season_cycle, "Season", "left")
+
     df = df.withColumn(
         "Payment_received_in_days",
         F.datediff(F.col("Payment_received_date"), F.col("Invoice_due_date")),
