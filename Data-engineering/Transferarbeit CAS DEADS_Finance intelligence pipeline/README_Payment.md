@@ -996,6 +996,90 @@ def umcc_partners_quality_check():
     )
 ```
 
+## 5. Payment (Gold) - Materialized View
+
+Purpose: business-renamed, analysis-ready payment table with payment-timeliness scoring, per invoice and per partner-season.
+
+- Reads `team.silver.payment` fully-qualified. Same pipeline, cross-schema target - per Databricks' own guidance this is the correct/recommended form for a dataset outside the pipeline's default schema, and registers a normal dependency edge (confirmed via the pipeline graph: silver -> gold shows connected, same as bronze -> silver).
+- Drops `partner` (raw) - only `partner_cleaned` is carried forward, renamed to `Partner`.
+- Drops `sales_paid_eur` - not needed at this layer.
+- Business renames (see `RENAMES` dict): `_season_from_filename` -> `Season`, `partner_cleaned` -> `Partner`, `partner_category` -> `Partner_Category`, `invoiced_original` -> `Invoiced_date`, `due_on` -> `Invoice_due_date`, `receipt_of_payment` -> `Payment_received_date`, `sales_contracted_eur` -> `Rights_fee`. Everything else (`competition`, `invoice_number`, `invoiced_eur`, `_source_file`, `_ingested_at`) is left as-is.
+- Underscores, not spaces, in the renamed columns - Delta rejects spaces in column names by default (`DELTA_INVALID_CHARACTERS_IN_COLUMN_NAMES`) unless column mapping is enabled on the table. Decided against enabling column mapping; space-friendly labels are applied at the dashboard/BI layer instead, not stored as physical column names.
+- `Payment_received_in_days` = `Payment_received_date` minus `Invoice_due_date`. Positive = paid late, negative = paid early.
+- `Payment_Diligence_Invoice` (per-row): `NULL` if `Payment_received_date` is null (no assessment made, not treated as Slow by omission); `Prompt Payer` if received within 30 days of due date; `Slow Payer` otherwise.
+- `Payment_Diligence_Season` (per `Partner` + `Season`, majority vote): counts `Prompt Payer` vs `Slow Payer` invoices within the group, using a `Window.partitionBy("Partner", "Season")` - rows with a null `Payment_Diligence_Invoice` don't count toward either side. Whichever has more wins; a tie defaults to `Slow Payer` (conservative default, deliberate choice); a group with zero assessable invoices gets `NULL`.
+- Deliberately two distinct names (`Payment_Diligence_Invoice` / `Payment_Diligence_Season`), not case-variants of the same string - Spark columns are case-preserving but not case-sensitive by default, so names differing only by case risk ambiguous-reference errors downstream.
+- No `dp.expect` on this table. The meaningful data-quality checks (invoice present, partner resolved) already run in silver; gold introduces no new raw data, only renames and derives from what silver already validated.
+
+```python
+"""Gold transformation: team.gold.payment"""
+
+import pyspark.pipelines as dp
+from pyspark.sql import functions as F
+from pyspark.sql.window import Window
+
+PROMPT_THRESHOLD_DAYS = 30  # <= 30 days = Prompt Payer, > 30 days = Slow Payer
+
+RENAMES = {
+    "_season_from_filename": "Season",
+    "partner_cleaned": "Partner",
+    "partner_category": "Partner_Category",
+    "invoiced_original": "Invoiced_date",
+    "due_on": "Invoice_due_date",
+    "receipt_of_payment": "Payment_received_date",
+    "sales_contracted_eur": "Rights_fee",
+}
+
+
+@dp.table(
+    name="team.gold.payment",
+    comment=(
+        "Gold: business-renamed, analysis-ready payment table with "
+        "per-invoice and per-partner-season payment diligence."
+    ),
+)
+def payment():
+    df = spark.read.table("team.silver.payment")
+
+    df = df.drop("partner", "sales_paid_eur")
+
+    for old, new in RENAMES.items():
+        df = df.withColumnRenamed(old, new)
+
+    df = df.withColumn(
+        "Payment_received_in_days",
+        F.datediff(F.col("Payment_received_date"), F.col("Invoice_due_date")),
+    )
+
+    # Null payment received date -> no assessment, not "Slow Payer" by omission.
+    df = df.withColumn(
+        "Payment_Diligence_Invoice",
+        F.when(F.col("Payment_received_date").isNull(), F.lit(None))
+        .when(F.col("Payment_received_in_days") <= PROMPT_THRESHOLD_DAYS, F.lit("Prompt Payer"))
+        .otherwise(F.lit("Slow Payer")),
+    )
+
+    # Majority vote per (Partner, Season), counting only invoices with a
+    # non-null Payment_Diligence_Invoice - rows with no payment received
+    # date don't influence the count either way.
+    partner_season_win = Window.partitionBy("Partner", "Season")
+    prompt_count = F.sum(
+        F.when(F.col("Payment_Diligence_Invoice") == "Prompt Payer", 1).otherwise(0)
+    ).over(partner_season_win)
+    slow_count = F.sum(
+        F.when(F.col("Payment_Diligence_Invoice") == "Slow Payer", 1).otherwise(0)
+    ).over(partner_season_win)
+
+    df = df.withColumn(
+        "Payment_Diligence_Season",
+        F.when((prompt_count + slow_count) == 0, F.lit(None))  # no assessable invoices
+        .when(prompt_count > slow_count, F.lit("Prompt Payer"))
+        .otherwise(F.lit("Slow Payer")),  # covers both real Slow majority and ties
+    )
+
+    return df
+```
+
 ---
 
 ## Key Technical Decisions / Gotchas
