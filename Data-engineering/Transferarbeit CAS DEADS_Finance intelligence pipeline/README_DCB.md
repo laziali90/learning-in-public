@@ -22,6 +22,9 @@ Lakeflow Declarative Pipeline covering Landing → Bronze → Silver → Gold fo
 
 **Purpose:** structural extraction from raw Excel files in landing, no business logic.
 
+**IMPORTANT:** in Databricks, both stages are computed in one python file. They're split out in github for simpler documentation
+
+
 - Source: Auto Loader (`cloudFiles`) streaming read from `/Volumes/team/landing/dcb/`, recursively covering both `historical/` and `incremental/` subfolders in a single stream
 - Format: native Databricks Excel reader (`cloudFiles.format = "excel"`, Beta feature, requires DBR 17.1+)
 - Sheet/range targeting: `dataAddress = "Summary!B5:Q100"` — extracts only the `Summary` tab, skips a hidden row and the label column, bounded to the actual data footprint
@@ -133,6 +136,22 @@ def dcb_raw():
 
     return df
 
+```
+
+---
+
+### Stage 2 - `dcb` (Materialized view)
+
+**Purpose:** structural cleanup of Excel-specific artifacts; still no business logic.
+
+- Reads `dcb_raw` as a **batch** source (`spark.read.table`) — required because the forward-fill logic below uses an order-dependent window function, which is unsupported on streaming DataFrames
+- `_row_id` generated via `monotonically_increasing_id()` here (moved out of the streaming stage after hitting `Expression(s): monotonically_increasing_id() is not supported with streaming DataFrames/Datasets`)
+- **Row filtering:** rows dropped where `UEFA_code`, `TEAM_code`, or `Budget_line` is null — removes trailing blank rows within the extraction range and rows without a valid identifying key
+- **Merged-cell forward-fill:** `Budget_category` (a merged Excel column, populated only on the first row of each merge group) is forward-filled using a window function (`last(..., ignorenulls=True)`), partitioned by `_source_file` and ordered by `_row_id`, so fill never bleeds across files
+- **Type correction:** all budget/amount columns explicitly cast to `double` (source inference defaulted to string, only fully resolved after fixing the row-offset issue)
+- **Row ID generation:** composite, human-readable key — `row_id = concat_ws("_", "dcb", competition, season, row_number)` — replacing the initial `monotonically_increasing_id()` long value, using `row_number()` per `_source_file` for a clean sequential counter
+
+```python
 
 @dp.table(
     name="dcb",
@@ -197,23 +216,7 @@ def dcb():
     )
 
     return df
-
 ```
-
----
-
-### Stage 2 - `dcb` (Materialized view)
-
-**Purpose:** structural cleanup of Excel-specific artifacts; still no business logic.
-
-- Reads `dcb_raw` as a **batch** source (`spark.read.table`) — required because the forward-fill logic below uses an order-dependent window function, which is unsupported on streaming DataFrames
-- `_row_id` generated via `monotonically_increasing_id()` here (moved out of the streaming stage after hitting `Expression(s): monotonically_increasing_id() is not supported with streaming DataFrames/Datasets`)
-- **Row filtering:** rows dropped where `UEFA_code`, `TEAM_code`, or `Budget_line` is null — removes trailing blank rows within the extraction range and rows without a valid identifying key
-- **Merged-cell forward-fill:** `Budget_category` (a merged Excel column, populated only on the first row of each merge group) is forward-filled using a window function (`last(..., ignorenulls=True)`), partitioned by `_source_file` and ordered by `_row_id`, so fill never bleeds across files
-- **Type correction:** all budget/amount columns explicitly cast to `double` (source inference defaulted to string, only fully resolved after fixing the row-offset issue)
-- **Row ID generation:** composite, human-readable key — `row_id = concat_ws("_", "dcb", competition, season, row_number)` — replacing the initial `monotonically_increasing_id()` long value, using `row_number()` per `_source_file` for a clean sequential counter
-
-
 
 ---
 
