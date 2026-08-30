@@ -1,6 +1,6 @@
 # DCB Pipeline — Technical Documentation
 
-Lakeflow Declarative Pipeline covering Landing → Bronze → Silver → Gold for the DCB (Detailed Club Budget) dataset.
+Lakeflow Declarative Pipeline covering Landing → Bronze → Silver → Gold for the DCB dataset.
 
 ---
 
