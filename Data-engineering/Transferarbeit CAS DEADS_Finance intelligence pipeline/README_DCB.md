@@ -149,7 +149,7 @@ def dcb_raw():
 def dcb():
     df = spark.read.table("dcb_raw")
 
-    # ================= ADDING INCREMENTAL DOWNLOAD CHECK =================
+    # INCREMENTAL DOWNLOAD CHECK =================
     # Only trust the most recently modified file per (competition, season).
     # dense_rank (not row_number) is required: every row from one file
     # shares the same _source_file_modified_at, so dense_rank correctly
