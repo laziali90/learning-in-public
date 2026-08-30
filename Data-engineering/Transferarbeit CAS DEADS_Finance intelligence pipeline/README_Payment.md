@@ -13,19 +13,14 @@ Lakeflow Declarative Pipeline covering Landing -> Bronze for the Payment dataset
 - **Orchestration:** single Lakeflow Declarative Pipeline (Python, `pyspark.pipelines` / `dp` API), run on-demand. Four transformation files; execution order is derived from data dependencies, not filenames:
 
 ```
-total_sheet_partners_raw -> total_sheet_partners --.
-                                                    \
-tv_payments_raw ---------> tv_payments -------------+
-sponsor_payments_raw ----> sponsor_payments --------+--> payment
-licensing_payments_raw --> licensing_payments ------'
-```
-
 - **Source formats:** both modern `.xlsx` and legacy `.xls` (files up to ~20 years old that cannot be re-saved). Both are handled in-pipeline; format is detected from magic bytes, not extension.
 - **Pipeline environment dependencies:** `openpyxl==3.1.*`, `xlrd==2.0.*` (must be added under Pipeline environment **and** applied via "Apply environment" - saving alone does not take effect)
 
 ---
 
-## 0. `total_sheet_partners_raw` / `total_sheet_partners` (Bronze, stage 0)
+## I) Original data storage, ingestion (LANDING → BRONZE)
+
+### A) `total_sheet_partners_raw` -> `total_sheet_partners`
 
 **Purpose:** build an authoritative, per-file list of real partner names from each workbook's Total Sheet. This is the backbone of partner resolution in stage 2.
 
@@ -397,7 +392,7 @@ def total_sheet_partners():
 
 ---
 
-## 1. `<category>_raw` (Bronze, stage 1) - Streaming Tables
+### B) `<category>_raw` (Streaming Tables)
 
 **Purpose:** structural extraction from the detail payment tabs. No business logic.
 
@@ -630,7 +625,7 @@ for cfg in CATEGORY_CONFIGS:
 
 ---
 
-## 2. `tv_payments` / `sponsor_payments` / `licensing_payments` (Bronze, stage 2) - Materialized Views
+### C) `<category>` (Materialized Views)
 
 **Purpose:** typing, row filtering, and partner resolution. Reads `<category>_raw` as a **batch** source - required because the window functions below are unsupported on streaming DataFrames.
 
@@ -885,7 +880,7 @@ def licensing_payments():
 
 ---
 
-## 3. `payment` (Bronze, stage 3) - Materialized View
+### D) `payment` (Materialized View)
 
 **Purpose:** harmonize the three category tables into the single table downstream consumers read.
 
@@ -915,7 +910,7 @@ def payment():
     return tv.unionByName(sponsor).unionByName(licensing)
 ```
 
-## 4. payment (Silver) - Materialized View
+## II) Data standardisation (BRONZE → SILVER) `payment` (Materialized View)
 
 Purpose: trim bronze.payment to business-relevant columns and enrich with a cleaned, cross-season partner name.
 
@@ -996,7 +991,7 @@ def umcc_partners_quality_check():
     )
 ```
 
-## 5. Payment (Gold) - Materialized View
+## III) Business readiness (SILVER → GOLD) `payment` (Materialized View)
 
 Purpose: business-renamed, analysis-ready payment table with payment-timeliness scoring, per invoice and per partner-season.
 
@@ -1085,16 +1080,3 @@ def payment():
 
     return df
 ```
-
----
-
-## Key Technical Decisions / Gotchas
-
-- **Short vs. fully-qualified table names decide the DAG.** A fully-qualified read (`spark.read.table("team.bronze.tv_payments_raw")`) is treated by Lakeflow as a *static external snapshot* - no dependency edge is added, and on a fresh run it fails outright because nothing has been built yet. Reads of pipeline-owned tables must use the **short name**. Fully-qualified is correct only for genuinely external reference data such as `partner_category_map`.
-- **`DROP TABLE` does not reset Auto Loader's checkpoint.** File-tracking state is pipeline-internal and survives the table being dropped, so a rebuild can produce a table that exists with zero rows. A genuine **full refresh** is required, and where checkpoint state proved unrecoverable, recreating the pipeline object itself was the reliable fix.
-- **Pipeline environment dependencies must be applied, not just saved.** `xlrd` appeared correctly in the Dependencies list while remaining absent at runtime; clicking **Apply environment** was what actually installed it. This presented as a stream failure with no obvious dependency error.
-- **Excel header text is not trusted anywhere.** Row 6 mislabels at least two columns relative to their real contents, and structurally-blank header cells are normal rather than exceptional. All naming is positional against a manually verified list.
-- **The installment column is not a valid block anchor.** It repeats `1st` across up to 4 consecutive rows for one invoice where a payment splits across territories. `invoice_number` is the only trustworthy row-level signal, and partner identity comes from the Total Sheet lookup rather than any layout heuristic.
-- **Materialized views with expectations cannot refresh incrementally.** A materialized view whose definition includes expectations is fully recomputed on every update by design. The `_raw` streaming tables remain genuinely incremental; stage 2 and 3 reprocess in full each run.
-- **Same-filename re-upload is not deduplicated.** *(Known limitation.)* Auto Loader tracks by file identity, so a corrected file uploaded under the same name may be skipped entirely; uploaded under a new name, its rows are **appended alongside** the original's rather than replacing them, leaving two versions of one season in `payment`. Uploads are manual, so the working practice is to remove the superseded file from the landing volume at the same time. A duplicate-detection expectation is a candidate improvement.
-- **Files are read twice per run** - once by the Total Sheet stage, once by the detail stage. Acceptable at this data volume, and it keeps the two concerns cleanly separated, but it is a known inefficiency.
