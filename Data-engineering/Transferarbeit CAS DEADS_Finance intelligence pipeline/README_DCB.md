@@ -41,7 +41,7 @@ Lakeflow Declarative Pipeline covering Landing → Bronze → Silver → Gold fo
 ```python
 from pyspark import pipelines as dp
 from pyspark.sql.functions import (
-    col, current_timestamp, monotonically_increasing_id,
+    col, current_timestamp, dense_rank, monotonically_increasing_id,
     last, regexp_extract, regexp_replace, to_date,
     row_number, concat_ws, lit
 )
@@ -83,7 +83,14 @@ numeric_columns = [
 
 @dp.table(
     name="dcb_raw",
-    comment="DCB Summary tab, raw extraction from landing (pre-forward-fill), columns renamed positionally to canonical names, with filename metadata extracted from decoded source path.",
+    comment=(
+        "DCB Summary tab, raw extraction from landing (pre-forward-fill), "
+        "columns renamed positionally to canonical names, with filename "
+        "metadata extracted from decoded source path. ADDING INCREMENTAL "
+        "DOWNLOAD CHECK: carries _source_file_modified_at (cloud storage "
+        "last-modified time) so dcb can determine which uploaded file is "
+        "current per competition/season."
+    ),
     table_properties={"quality": "bronze"}
 )
 @dp.expect("valid_season", "season != ''")
@@ -105,6 +112,14 @@ def dcb_raw():
 
     df = df.withColumn("_ingested_at", current_timestamp())
     df = df.withColumn("_source_file", col("_metadata.file_path"))
+    
+    # INCREMENTAL DOWNLOAD CHECK
+    # Cloud storage last-modified time - the robust "which upload is
+    # current" signal, independent of document_date (which is parsed from
+    # the filename and only has day-level precision, so it can't
+    # distinguish two files uploaded for the same season on the same day).
+    df = df.withColumn("_source_file_modified_at", col("_metadata.file_modification_time"))
+    # =======================================================================
     df = df.withColumn("_source_file_decoded", regexp_replace(col("_source_file"), "%20", " "))
 
     df = df.withColumn(
@@ -119,11 +134,38 @@ def dcb_raw():
 
 @dp.table(
     name="dcb",
-    comment="DCB Summary tab: filtered to complete rows (UEFA_code, TEAM_code, Budget_line), Budget_category forward-filled, numeric columns cast, row_id generated.",
+    comment=(
+        "DCB Summary tab: filtered to complete rows (UEFA_code, TEAM_code, "
+        "Budget_line), Budget_category forward-filled, numeric columns "
+        "cast, row_id generated. ADDING INCREMENTAL DOWNLOAD CHECK: also "
+        "filtered to the most recently modified file per (competition, "
+        "season) - superseded uploads remain in dcb_raw as history but are "
+        "excluded here."
+    ),
     table_properties={"quality": "bronze"}
 )
 def dcb():
     df = spark.read.table("dcb_raw")
+
+    # ================= ADDING INCREMENTAL DOWNLOAD CHECK =================
+    # Only trust the most recently modified file per (competition, season).
+    # dense_rank (not row_number) is required: every row from one file
+    # shares the same _source_file_modified_at, so dense_rank correctly
+    # keeps ALL of that file's rows, where row_number would arbitrarily
+    # cut it off partway through. This also removes the row_id collision
+    # risk that existed before this filter, since only one file per season
+    # now survives to reach concat_ws("_", "dcb", competition, season,
+    # row_number) below.
+    latest_window = Window.partitionBy("competition", "season").orderBy(
+        col("_source_file_modified_at").desc()
+    )
+    df = (
+        df.withColumn("_snapshot_rank", dense_rank().over(latest_window))
+        .filter(col("_snapshot_rank") == 1)
+        .drop("_snapshot_rank")
+    )
+    # =======================================================================
+
     df = df.withColumn("_row_id", monotonically_increasing_id())
 
     df = df.filter(
