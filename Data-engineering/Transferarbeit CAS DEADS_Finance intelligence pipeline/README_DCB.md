@@ -16,7 +16,9 @@ Lakeflow Declarative Pipeline covering Landing → Bronze → Silver → Gold fo
 
 ---
 
-## 1. `dcb_raw` (Bronze, stage 1) — Streaming Table
+## Original data storage, ingestion,  (LANDING → BRONZE)
+
+### A) Stage 1 - `dcb_raw` (Streaming table)
 
 **Purpose:** structural extraction from raw Excel files in landing, no business logic.
 
@@ -200,7 +202,7 @@ def dcb():
 
 ---
 
-## 2. `dcb` (Bronze, stage 2) — Materialized View
+### Stage 2 - `dcb` (Materialized view)
 
 **Purpose:** structural cleanup of Excel-specific artifacts; still no business logic.
 
@@ -215,7 +217,8 @@ def dcb():
 
 ---
 
-## 3. `team.silver.dcb` — Materialized View
+## Data standardisation (BRONZE → SILVER) `team.silver.dcb` (Materialized View)
+
 
 **Purpose:** business-relevant column selection and dimensional enrichment.
 
@@ -258,51 +261,7 @@ def dcb_silver():
     return df.join(dim, on="season", how="left")
 ```
 
----
-
-## 4. `team.dim.umccseasoncycle` — Dimension Table (SQL, static)
-
-**Purpose:** maps every football season to its 3-season reporting cycle.
-
-- Generated via a one-time `CREATE OR REFRESH TABLE ... AS` SQL statement, not a pipeline table
-- Logic: cycles run in consecutive 3-season groups, anchored backward from the most recent complete cycle (`24-25, 25-26, 26-27` → `24-27`), extending back to season `90-91`
-- Static reference data — not expected to change on a regular cadence; lives in the shared `team.dim` schema alongside other project dimension tables
-
-```sql
-CREATE OR REPLACE TABLE team.dim.UMCCseasoncycle AS
-WITH years AS (
-  SELECT explode(sequence(1990, 2026)) AS start_year
-),
-calc AS (
-  SELECT
-    start_year,
-    concat(
-      lpad(CAST(start_year % 100 AS STRING), 2, '0'), '-',
-      lpad(CAST((start_year + 1) % 100 AS STRING), 2, '0')
-    ) AS season,
-    2026 - start_year AS n
-  FROM years
-),
-grouped AS (
-  SELECT
-    season,
-    start_year,
-    floor(n / 3) AS grp
-  FROM calc
-)
-SELECT
-  season,
-  concat(
-    lpad(CAST((2024 - 3 * grp) % 100 AS STRING), 2, '0'), '-',
-    lpad(CAST((2027 - 3 * grp) % 100 AS STRING), 2, '0')
-  ) AS cycle
-FROM grouped
-ORDER BY start_year;
-
-```
----
-
-## 5. `team.gold.dcb` — Materialized View
+## Business readiness (SILVER → GOLD) `team.gold.dcb` (Materialized View)
 
 **Purpose:** analytics-ready KPI layer.
 
@@ -392,9 +351,11 @@ def dcb_gold():
 
 ---
 
-## CLEANS
+## Support / Pipeline maintenance code
 
-### Reset Auto Loader schema and checkpoint state (Python, run in a notebook attached to a cluster):
+### CLEAN
+
+#### Reset Auto Loader schema and checkpoint state (Python, run in a notebook attached to a cluster):
 Clears the persisted Auto Loader schema inference cache and streaming checkpoint for the dcb landing volume. Required whenever the source extraction logic changes structurally (e.g. cell range, header handling, or column count) — since cloudFiles.schemaEvolutionMode = "none" locks the schema to whatever was inferred on the first run, this cache must be manually cleared before Auto Loader will pick up the new structure.
 
 ```python
@@ -402,7 +363,7 @@ dbutils.fs.rm("/Volumes/team/landing/dcb/_schema/", recurse=True)
 dbutils.fs.rm("/Volumes/team/landing/dcb/_checkpoints/", recurse=True)
 ```
 
-### Drop bronze DCB tables (SQL, run in the SQL Editor):
+#### Drop bronze DCB tables (SQL, run in the SQL Editor):
 Drops the existing bronze tables so they can be fully rebuilt from a clean state. Run alongside the schema/checkpoint reset above whenever dcb_raw's or dcb's structure changes — without this, the pipeline would attempt to write a new schema into a table still expecting the old one, causing a mismatch error.
 
 ```sql
@@ -412,9 +373,9 @@ DROP TABLE IF EXISTS team.bronze.dcb;
 
 ---
 
-## CHECKS
+### CHECKS
 
-### Per-file ingestion sense check:
+#### Per-file ingestion sense check:
 Shows every distinct source file ingested into dcb_raw so far, with row count and ingestion timestamp, ordered by most recently ingested first. Useful after uploading a new file and running the pipeline — confirms exactly which file was picked up and how many rows it contributed, without digging through the pipeline UI or event log.
 
 ```sql
@@ -427,7 +388,7 @@ GROUP BY _source_file
 ORDER BY ingested_at DESC;
 ```
 
-### Row-count consistency check (raw vs. filtered):
+#### Row-count consistency check (raw vs. filtered):
 Compares the total unfiltered row count in dcb_raw against the filtered, forward-filled row count in dcb. Since dcb drops incomplete rows (missing UEFA_code, TEAM_code, or Budget_line), the filtered total should always be less than or equal to the raw total — a quick way to confirm the filtering logic is behaving as expected as new files are added.
 
 ```sql
@@ -436,6 +397,11 @@ SELECT COUNT(*) FROM team.bronze.dcb;
 ```
 
 ---
+
+---
+
+
+
 
 ## Key Technical Decisions / Gotchas
 
