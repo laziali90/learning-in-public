@@ -1178,6 +1178,3 @@ def payment():
 
     return df
 ```
-
-    return df
-```
