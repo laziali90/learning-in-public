@@ -317,40 +317,6 @@ def dcb_gold():
     df = df.withColumn("Cost_main_category", lit("Marketing costs"))
 
     return df
-from pyspark import pipelines as dp
-from pyspark.sql.functions import col, when, round as spark_round, lit
-
-@dp.table(
-    name="team.gold.dcb",
-    comment="DCB gold: budget accuracy metrics, budget difference, and cost category tagging.",
-    table_properties={"quality": "gold"}
-)
-@dp.expect("valid_budget_ratio", "Total_budget_last_forecast_EUR IS NOT NULL AND Total_budget_last_forecast_EUR != 0")
-def dcb_gold():
-    df = spark.read.table("team.silver.dcb")
-
-    ratio = col("Total_expected_spend_EUR") / col("Total_budget_last_forecast_EUR")
-
-    df = df.withColumn("budget_accuracy_calc", spark_round(ratio * 100, 2))
-
-    df = df.withColumn(
-        "budget_accuracy_sum",
-        when(ratio > 1.15, "significantly overspent")
-        .when((ratio > 1.05) & (ratio <= 1.15), "overspent")
-        .when((ratio >= 0.95) & (ratio <= 1.05), "in budget")
-        .when((ratio >= 0.85) & (ratio < 0.95), "underspent")
-        .when(ratio < 0.85, "significantly underspent")
-        .otherwise(None)
-    )
-
-    df = df.withColumn(
-        "Budget_difference",
-        col("Total_expected_spend_EUR") - col("Total_budget_last_forecast_EUR")
-    )
-
-    df = df.withColumn("Cost_main_category", lit("Marketing costs"))
-
-    return df
 ```
 
 ---
