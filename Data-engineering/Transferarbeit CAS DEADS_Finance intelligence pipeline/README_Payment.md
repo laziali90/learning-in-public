@@ -751,6 +751,37 @@ COLUMN_TYPES = {
 # -----------------------------------------------------------------------------
 
 def _transform(df, lookup, tab_category: str):
+    # ================= ADDING INCREMENTAL DOWNLOAD CHECK =================
+    # Only trust the most recently modified file per (competition, season).
+    # <category>_raw is append-only (Auto Loader never forgets a file, and
+    # never notices one was deleted from landing), so without this filter
+    # a corrected re-upload for a season already in the table would
+    # silently double-count every invoice in that season rather than
+    # replacing the superseded file's rows.
+    #
+    # competition is computed here (moved up from later in this function,
+    # where the original code computed it a second time right before
+    # rename_exprs - that duplicate computation has been removed since
+    # this one now covers it) because the ranking below needs it.
+    #
+    # dense_rank (not row_number) is required: every row from one file
+    # shares the same _source_file_modified_at, so dense_rank correctly
+    # keeps ALL of the winning file's rows across every matching tab,
+    # where row_number would arbitrarily cut it off partway through.
+    df = df.withColumn(
+        "competition",
+        F.regexp_extract(F.col("_source_file"), COMPETITION_PATTERN, 1),
+    )
+    latest_file_window = Window.partitionBy(
+        "competition", "_season_from_filename"
+    ).orderBy(F.col("_source_file_modified_at").desc())
+    df = (
+        df.withColumn("_file_rank", F.dense_rank().over(latest_file_window))
+        .filter(F.col("_file_rank") == 1)
+        .drop("_file_rank")
+    )
+    # =======================================================================
+
     df = df.withColumn(
         COL_INVOICE,
         F.expr(f"try_cast(regexp_extract(trim({COL_INVOICE}), '^([0-9]+)', 1) as bigint)"),
@@ -819,7 +850,7 @@ def _transform(df, lookup, tab_category: str):
     )
 
     # Human-readable row id - includes the tab name so it stays unique
-    # even when two tabs from the same file share a block/row number.
+    # even when two tabs from one file share a block and row number.
     df = df.withColumn(
         "row_id",
         F.concat_ws(
@@ -829,11 +860,6 @@ def _transform(df, lookup, tab_category: str):
             F.col("_block_id").cast("string"),
             F.col("_sheet_row_number").cast("string"),
         ),
-    )
-
-    df = df.withColumn(
-        "competition",
-        F.regexp_extract(F.col("_source_file"), COMPETITION_PATTERN, 1),
     )
 
     rename_exprs = []
@@ -861,6 +887,7 @@ def _transform(df, lookup, tab_category: str):
         "_sheet_row_number",
         "_source_tab",
         "_source_file",
+        "_source_file_modified_at",  # ADDING INCREMENTAL DOWNLOAD CHECK
         "_ingested_at",
         "_season_from_filename",
         *rename_exprs,
@@ -871,7 +898,11 @@ def _transform(df, lookup, tab_category: str):
     name="tv_payments",
     comment=(
         "Bronze: typed, header-named TV payment data. Partner names and "
-        "categories are resolved against total_sheet_partners, per source file."
+        "categories are resolved against total_sheet_partners, per source "
+        "file. ADDING INCREMENTAL DOWNLOAD CHECK: filtered to the most "
+        "recently modified file per (competition, season) - superseded "
+        "uploads remain in tv_payments_raw as history but are excluded "
+        "here."
     ),
 )
 @dp.expect("has_partner", "partner IS NOT NULL")
@@ -885,8 +916,12 @@ def tv_payments():
 @dp.table(
     name="sponsor_payments",
     comment=(
-        "Bronze: typed, header-named Sponsor payment data. Partner names and "
-        "categories are resolved against total_sheet_partners, per source file."
+        "Bronze: typed, header-named Sponsor payment data. Partner names "
+        "and categories are resolved against total_sheet_partners, per "
+        "source file. ADDING INCREMENTAL DOWNLOAD CHECK: filtered to the "
+        "most recently modified file per (competition, season) - "
+        "superseded uploads remain in sponsor_payments_raw as history but "
+        "are excluded here."
     ),
 )
 @dp.expect("has_partner", "partner IS NOT NULL")
@@ -900,8 +935,12 @@ def sponsor_payments():
 @dp.table(
     name="licensing_payments",
     comment=(
-        "Bronze: typed, header-named Licensing payment data. Partner names and "
-        "categories are resolved against total_sheet_partners, per source file."
+        "Bronze: typed, header-named Licensing payment data. Partner names "
+        "and categories are resolved against total_sheet_partners, per "
+        "source file. ADDING INCREMENTAL DOWNLOAD CHECK: filtered to the "
+        "most recently modified file per (competition, season) - "
+        "superseded uploads remain in licensing_payments_raw as history "
+        "but are excluded here."
     ),
 )
 @dp.expect("has_partner", "partner IS NOT NULL")
@@ -910,6 +949,7 @@ def licensing_payments():
     df = spark.read.table("licensing_payments_raw")  # noqa: F821
     lookup = spark.read.table("total_sheet_partners")  # noqa: F821
     return _transform(df, lookup, "LICENSEE")
+
 ```
 
 ---
