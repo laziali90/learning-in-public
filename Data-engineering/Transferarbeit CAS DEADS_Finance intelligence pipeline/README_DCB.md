@@ -11,11 +11,11 @@ Lakeflow Declarative Pipeline covering Landing → Bronze → Silver → Gold fo
 - **Bronze schema:** `team.bronze`
 - **Silver schema:** `team.silver`
 - **Gold schema:** `team.gold`
-- **Orchestration:** single Lakeflow Declarative Pipeline (Python, `pyspark.pipelines` / `dp` API), run on-demand; full DAG (`dcb_raw` → `dcb` → `team.silver.dcb` → `team.gold.dcb`) executes on every run, with streaming/materialized-view engines each determining incremental vs. full recompute internally.
+- **Orchestration:** single Lakeflow Declarative Pipeline (Python, `pyspark.pipelines` / `dp` API), scheduled weekly for **Friday 13:00 (Swiss time)**. New source files are expected to be uploaded to the landing volume each Friday morning, ahead of that run, so a given week's upload is picked up the same day. Full DAG (`dcb_raw` → `dcb` → `team.silver.dcb` → `team.gold.dcb`) executes on every run, with streaming/materialized-view engines each determining incremental vs. full recompute internally.
 
 ---
 
-## I) Original data storage, ingestion,  (LANDING → BRONZE)
+## I) Original data storage, ingestion (LANDING → BRONZE)
 
 ### A) Stage 1 - `dcb_raw` (Streaming table)
 
@@ -31,6 +31,7 @@ Lakeflow Declarative Pipeline covering Landing → Bronze → Silver → Gold fo
 - `cloudFiles.schemaEvolutionMode = "none"` — schema is fixed by design; Excel streaming does not support schema evolution
 - `cloudFiles.schemaLocation` — persisted Auto Loader schema cache; must be manually cleared (along with the checkpoint) whenever the extraction range or column count changes
 - Metadata columns added: `_ingested_at`, `_source_file` (raw `_metadata.file_path`, URL-encoded)
+- **`_source_file_modified_at`** — cloud storage last-modified time, captured immediately after `_source_file`. This is the timestamp `dcb` (stage 2) uses to determine which uploaded file is authoritative for a given competition/season. It's a property of the file itself in storage, not of when the pipeline happens to run, so it stays correct however irregularly the pipeline is triggered relative to when files are actually uploaded
 - `_source_file_decoded` — `%20` sequences replaced with literal spaces, since `_metadata.file_path` returns URL-encoded paths, which silently broke filename-based regex extraction
 - Filename-derived columns extracted via regex against the decoded path, based on a fixed filename taxonomy (`YYYY-MM-DD <COMPETITION> DCB <SEASON>`):
   - `document_date` (cast to `date`)
@@ -141,14 +142,15 @@ def dcb_raw():
 
 ### Stage 2 - `dcb` (Materialized view)
 
-**Purpose:** structural cleanup of Excel-specific artifacts; still no business logic.
+**Purpose:** select the single authoritative file per (competition, season) and perform structural cleanup of Excel-specific artifacts; still no business logic beyond file selection.
 
 - Reads `dcb_raw` as a **batch** source (`spark.read.table`) — required because the forward-fill logic below uses an order-dependent window function, which is unsupported on streaming DataFrames
-- `_row_id` generated via `monotonically_increasing_id()` here (moved out of the streaming stage after hitting `Expression(s): monotonically_increasing_id() is not supported with streaming DataFrames/Datasets`)
+- **Latest-file filter (runs first, before anything else):** rows are restricted to the single most recently modified source file per `(competition, season)`, ranked by `_source_file_modified_at` via `dense_rank()` partitioned on `(competition, season)` and ordered descending. `dense_rank()` rather than `row_number()` is required here — every row belonging to one file shares the same `_source_file_modified_at`, so `dense_rank()` correctly keeps *all* of that file's rows, where `row_number()` would arbitrarily cut the winning file off partway through. Superseded uploads for a season remain in `dcb_raw` as history but are excluded from `dcb` onward — a corrected re-upload replaces the prior file's rows here rather than being appended alongside them, regardless of whether the old file is deleted from the landing volume
+- `_row_id` generated via `monotonically_increasing_id()` here (moved out of the streaming stage after hitting `Expression(s): monotonically_increasing_id() is not supported with streaming DataFrames/Datasets`), applied after the latest-file filter so IDs are only ever assigned to rows that survive it
 - **Row filtering:** rows dropped where `UEFA_code`, `TEAM_code`, or `Budget_line` is null — removes trailing blank rows within the extraction range and rows without a valid identifying key
 - **Merged-cell forward-fill:** `Budget_category` (a merged Excel column, populated only on the first row of each merge group) is forward-filled using a window function (`last(..., ignorenulls=True)`), partitioned by `_source_file` and ordered by `_row_id`, so fill never bleeds across files
 - **Type correction:** all budget/amount columns explicitly cast to `double` (source inference defaulted to string, only fully resolved after fixing the row-offset issue)
-- **Row ID generation:** composite, human-readable key — `row_id = concat_ws("_", "dcb", competition, season, row_number)` — replacing the initial `monotonically_increasing_id()` long value, using `row_number()` per `_source_file` for a clean sequential counter
+- **Row ID generation:** composite, human-readable key — `row_id = concat_ws("_", "dcb", competition, season, row_number)` — replacing the initial `monotonically_increasing_id()` long value, using `row_number()` per `_source_file` for a clean sequential counter. This key is now guaranteed unique across the table's full history: before the latest-file filter existed, two uploads for the same `(competition, season)` could produce colliding `row_id` values since the key doesn't include a per-file component; the filter above ensures only one source file per `(competition, season)` ever reaches this step, so the collision risk no longer applies
 
 ```python
 
