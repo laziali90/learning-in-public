@@ -16,7 +16,7 @@ Lakeflow Declarative Pipeline covering Landing → Bronze → Silver → Gold fo
 
 ---
 
-## Original data storage, ingestion,  (LANDING → BRONZE)
+## I) Original data storage, ingestion,  (LANDING → BRONZE)
 
 ### A) Stage 1 - `dcb_raw` (Streaming table)
 
@@ -220,7 +220,7 @@ def dcb():
 
 ---
 
-## Data standardisation (BRONZE → SILVER) `team.silver.dcb` (Materialized View)
+## II) Data standardisation (BRONZE → SILVER) `team.silver.dcb` (Materialized View)
 
 
 **Purpose:** business-relevant column selection and dimensional enrichment.
@@ -264,7 +264,7 @@ def dcb_silver():
     return df.join(dim, on="season", how="left")
 ```
 
-## Business readiness (SILVER → GOLD) `team.gold.dcb` (Materialized View)
+## III) Business readiness (SILVER → GOLD) `team.gold.dcb` (Materialized View)
 
 **Purpose:** analytics-ready KPI layer.
 
@@ -354,7 +354,7 @@ def dcb_gold():
 
 ---
 
-## Support / Pipeline maintenance code
+## Support / Pipeline maintenance execution code
 
 ### CLEAN
 
@@ -400,10 +400,6 @@ SELECT COUNT(*) FROM team.bronze.dcb;
 ```
 
 ---
-
----
-
-
 
 
 ## Key Technical Decisions / Gotchas
