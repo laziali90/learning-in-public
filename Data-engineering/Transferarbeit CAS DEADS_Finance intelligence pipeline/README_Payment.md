@@ -610,7 +610,12 @@ def _build_raw_table(raw_table: str, name_pattern: "re.Pattern"):
         comment=(
             f"Bronze raw: structural extraction of every sheet matching "
             f"'{name_pattern.pattern}' from landing. Positional columns "
-            f"only, no header/type resolution yet."
+            f"only, no header/type resolution yet. ADDING INCREMENTAL "
+            f"DOWNLOAD CHECK: carries _source_file_modified_at (cloud "
+            f"storage last-modified time) so downstream stage-2 tables can "
+            f"determine which uploaded file is current per season, without "
+            f"relying on filename conventions or manual deletion of "
+            f"superseded files."
         ),
     )
     def _tbl():
@@ -619,10 +624,20 @@ def _build_raw_table(raw_table: str, name_pattern: "re.Pattern"):
             .option("cloudFiles.format", "binaryFile")
             .option("pathGlobFilter", "*.xls*")
             .load(LANDING_VOLUME_PATH)
+            # ============ ADDED INCREMENTAL DOWNLOAD CHECK ============
+            # Captured immediately after the read, before any
+            # select/explode, since _metadata may not resolve reliably
+            # several transforms later.
+            .withColumn("_file_modified_at", F.col("_metadata.file_modification_time"))
+            # ============================================================
         )
 
         parsed = raw.withColumn("_parsed", parser_udf(F.col("content")))
-        exploded = parsed.select("path", F.explode(F.col("_parsed.rows")).alias("_row"))
+        exploded = parsed.select(
+            "path",
+            "_file_modified_at",  # ADDING INCREMENTAL DOWNLOAD CHECK
+            F.explode(F.col("_parsed.rows")).alias("_row"),
+        )
 
         # Positional column rename: col_1 .. col_N_COLS. Deliberately NOT
         # trusting source header text (inconsistent across files/tabs).
@@ -631,11 +646,14 @@ def _build_raw_table(raw_table: str, name_pattern: "re.Pattern"):
         result = (
             exploded.select(
                 "path",
+                "_file_modified_at",  # ADDING INCREMENTAL DOWNLOAD CHECK
                 F.col("_row.sheet_name").alias("_source_tab"),
                 F.col("_row.sheet_row_number").alias("_sheet_row_number"),
                 *col_exprs,
             )
             .withColumn("_source_file", _decode_udf(F.col("path")))
+            # ADDING INCREMENTAL DOWNLOAD CHECK
+            .withColumnRenamed("_file_modified_at", "_source_file_modified_at")
             .withColumn(
                 "_ingested_at",
                 F.date_format(F.current_timestamp(), "yyyy-MM-dd'T'HH:mm:ssXXX"),
@@ -655,6 +673,7 @@ def _build_raw_table(raw_table: str, name_pattern: "re.Pattern"):
 
 for cfg in CATEGORY_CONFIGS:
     _build_raw_table(cfg["raw_table"], cfg["pattern"])
+
 ```
 
 ---
