@@ -10,9 +10,7 @@ Lakeflow Declarative Pipeline covering Landing -> Bronze for the Payment dataset
 - **Landing volume:** `team.landing.payment` (subfolders: `historical/`, `incremental/`)
 - **Bronze schema:** `team.bronze`
 - **Reference data:** `team.bronze.partner_category_map` (hand-maintained, SQL-created, never written by the pipeline)
-- **Orchestration:** single Lakeflow Declarative Pipeline (Python, `pyspark.pipelines` / `dp` API), run on-demand. Four transformation files; execution order is derived from data dependencies, not filenames:
-
-```
+- **Orchestration:** single Lakeflow Declarative Pipeline (Python, `pyspark.pipelines` / `dp` API), run on-demand. Four transformation files; execution order is derived from data dependencies, not filenames
 - **Source formats:** both modern `.xlsx` and legacy `.xls` (files up to ~20 years old that cannot be re-saved). Both are handled in-pipeline; format is detected from magic bytes, not extension.
 - **Pipeline environment dependencies:** `openpyxl==3.1.*`, `xlrd==2.0.*` (must be added under Pipeline environment **and** applied via "Apply environment" - saving alone does not take effect)
 
