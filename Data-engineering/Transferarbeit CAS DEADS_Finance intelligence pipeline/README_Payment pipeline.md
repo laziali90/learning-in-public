@@ -1086,19 +1086,20 @@ def umcc_partners_quality_check():
 
 ## III) Business readiness (SILVER → GOLD) `payment` (Materialized View)
 
-**Purpose**: business-renamed, analysis-ready payment table with payment-timeliness scoring, per invoice and per partner-season. Rows with no resolvable partner are dropped here - this is the one place in the whole pipeline that drops rows on a quality check, rather than warning.
+Purpose: business-renamed, analysis-ready payment table with payment-timeliness scoring, per invoice and per partner-season. Rows with no resolvable partner are dropped here - this is the one place in the whole pipeline that drops rows on a quality check, rather than warning.
 
 - Reads `team.silver.payment` fully-qualified. Same pipeline, cross-schema target - per Databricks' own guidance this is the correct/recommended form for a dataset outside the pipeline's default schema, and registers a normal dependency edge (confirmed via the pipeline graph: silver -> gold shows connected, same as bronze -> silver).
-- **`has_partner` expectation uses `expect_or_drop`, not `expect`.** Every other quality check in this pipeline (bronze's `has_partner`, silver's `has_partner_cleaned`, `umcc_partners_quality_check`) is deliberately warn-only - nothing gets dropped anywhere else on the strength of a check. This is the one intentional exception: by the time a row reaches gold, it has already passed through three independent upstream checks confirming partner resolution, so a `Partner IS NULL` row here is either the confirmed UEL 13-14 source-data gap or a genuinely unmapped partner - either way, not usable for analysis, and not worth carrying downstream into dashboards.
-**Consequence: gold's row count no longer matches silver's 1:1.** Worth remembering if reconciling row counts across layers later.
-
+- **`has_partner` expectation uses `expect_or_drop`, not `expect`.** Every other quality check in this pipeline (bronze's `has_partner`, silver's `has_partner_cleaned`, `umcc_partners_quality_check`) is deliberately warn-only - nothing gets dropped anywhere else on the strength of a check. This is the one intentional exception: by the time a row reaches gold, it has already passed through three independent upstream checks confirming partner resolution, so a `Partner IS NULL` row here is either the confirmed UEL 13-14 source-data gap or a genuinely unmapped partner - either way, not usable for analysis, and not worth carrying downstream into dashboards. **Consequence: gold's row count no longer matches silver's 1:1.** Worth remembering if reconciling row counts across layers later.
 - Drops `partner` (raw) - only `partner_cleaned` is carried forward, renamed to `Partner`.
 - Drops `sales_paid_eur` - not needed at this layer.
 - Business renames (see `RENAMES` dict): `_season_from_filename` -> `Season`, `partner_cleaned` -> `Partner`, `partner_category` -> `Partner_Category`, `invoiced_original` -> `Invoiced_date`, `due_on` -> `Invoice_due_date`, `receipt_of_payment` -> `Payment_received_date`, `sales_contracted_eur` -> `Rights_fee`. Everything else (`competition`, `invoice_number`, `invoiced_eur`, `_source_file`, `_ingested_at`) is left as-is.
 - Underscores, not spaces, in the renamed columns - Delta rejects spaces in column names by default (`DELTA_INVALID_CHARACTERS_IN_COLUMN_NAMES`) unless column mapping is enabled on the table. Decided against enabling column mapping; space-friendly labels are applied at the dashboard/BI layer instead, not stored as physical column names.
 - Enriched with `cycle` from `team.dim.umccseasoncycle`, joined on `Season`. The join relies on Spark's default case-insensitive column resolution (`Season` on this side matching `season` on the dim side) rather than an explicit alias - works under default Spark settings, but would break if case-sensitive resolution were ever turned on for this workspace.
 - `Payment_received_in_days` = `Payment_received_date` minus `Invoice_due_date`. Positive = paid late, negative = paid early.
-- `Payment_Diligence_Invoice` (per-row): `NULL` if `Payment_received_date` is null (no assessment made, not treated as Slow by omission); `Prompt Payer` if received within 30 days of due date; `Slow Payer` otherwise.
+- **`Payment_Diligence_Invoice` is a strict, no-grace-period rule** (revised from an earlier 30-day grace period): paid on or before `Invoice_due_date` = `Prompt Payer`; paid even one day after = `Slow Payer`. `PROMPT_PAYER_MAX_DAYS = 0` controls the cutoff.
+- **Two independent null checks, evaluated in order, both required:**
+  1. `Invoice_due_date IS NULL` -> `NULL`. No due date means no assessment is possible at all - checked first, so nothing downstream of it matters if this fires.
+  2. `Payment_received_date IS NULL` -> `NULL`. Not yet paid, not "Slow Payer" by omission. This check exists deliberately: `datediff(NULL, x)` evaluates to `NULL` in SQL, and `NULL <= 0` is `NULL` (not true), so without this explicit check an unpaid invoice would silently fall through to `Slow Payer` via `.otherwise()` - the opposite of the intended behavior.
 - `Payment_Diligence_Season` (per `Partner` + `Season`, majority vote): counts `Prompt Payer` vs `Slow Payer` invoices within the group, using a `Window.partitionBy("Partner", "Season")` - rows with a null `Payment_Diligence_Invoice` don't count toward either side. Whichever has more wins; a tie defaults to `Slow Payer` (conservative default, deliberate choice); a group with zero assessable invoices gets `NULL`.
 - Deliberately two distinct names (`Payment_Diligence_Invoice` / `Payment_Diligence_Season`), not case-variants of the same string - Spark columns are case-preserving but not case-sensitive by default, so names differing only by case risk ambiguous-reference errors downstream.
 
@@ -1109,7 +1110,7 @@ import pyspark.pipelines as dp
 from pyspark.sql import functions as F
 from pyspark.sql.window import Window
 
-PROMPT_THRESHOLD_DAYS = 30  # <= 30 days = Prompt Payer, > 30 days = Slow Payer
+PROMPT_PAYER_MAX_DAYS = 0  # paid on or before due date = Prompt Payer; any days late = Slow Payer
 
 RENAMES = {
     "_season_from_filename": "Season",
@@ -1150,11 +1151,16 @@ def payment():
         F.datediff(F.col("Payment_received_date"), F.col("Invoice_due_date")),
     )
 
-    # Null payment received date -> no assessment, not "Slow Payer" by omission.
+    # Null due date -> no assessment possible, tag is null.
+    # Null received date -> not yet paid, also null (not Slow by omission -
+    # datediff(NULL, x) is NULL, and NULL <= 0 is NULL in SQL, not True, so
+    # without this explicit check it would fall through to "Slow Payer" via
+    # .otherwise(), which is wrong).
     df = df.withColumn(
         "Payment_Diligence_Invoice",
-        F.when(F.col("Payment_received_date").isNull(), F.lit(None))
-        .when(F.col("Payment_received_in_days") <= PROMPT_THRESHOLD_DAYS, F.lit("Prompt Payer"))
+        F.when(F.col("Invoice_due_date").isNull(), F.lit(None))
+        .when(F.col("Payment_received_date").isNull(), F.lit(None))
+        .when(F.col("Payment_received_in_days") <= PROMPT_PAYER_MAX_DAYS, F.lit("Prompt Payer"))
         .otherwise(F.lit("Slow Payer")),
     )
 
