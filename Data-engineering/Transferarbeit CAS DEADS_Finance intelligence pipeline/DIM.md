@@ -40,7 +40,9 @@ FROM grouped
 ORDER BY start_year;
 
 ```
+
 ---
+
 
 ### `team.bronze.partner_category_map` (SQL, static)
 
@@ -79,6 +81,9 @@ WHERE NOT EXISTS (
     WHERE upper(trim(m.section_label)) = upper(trim(seed.section_label))
 );
 ```
+
+---
+
 ### `team.dim.umcc.partner` (SQL, static)
 
 #### A) Creation
