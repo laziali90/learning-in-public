@@ -1,6 +1,6 @@
 # Payment Pipeline - Technical Documentation
 
-Lakeflow Declarative Pipeline covering Landing -> Bronze for the Payment dataset (broadcaster, sponsor, supplier and licensee payments across UCL/UEL seasons). Sibling to the DCB pipeline; shares its two-stage bronze pattern, but diverges substantially because the source workbooks are far less regular.
+Lakeflow Declarative Pipeline covering Landing → Bronze → Silver → Gold for the Payment dataset.
 
 ---
 
