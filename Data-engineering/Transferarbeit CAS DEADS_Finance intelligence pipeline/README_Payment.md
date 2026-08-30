@@ -251,7 +251,9 @@ _parse_udf = F.udf(_parse_total_sheet, PARSE_RESULT_SCHEMA)
     comment=(
         "Landing raw: one row per partner as listed in each workbook's "
         "Total Sheet (Euro preferred, CHF fallback). Structural extraction "
-        "only."
+        "only. Carries _source_file_modified_at (ADDING INCREMENTAL "
+        "DOWNLOAD CHECK) so total_sheet_partners can determine which "
+        "uploaded file is current per competition/season."
     ),
 )
 def total_sheet_partners_raw():
@@ -260,11 +262,19 @@ def total_sheet_partners_raw():
         .option("cloudFiles.format", "binaryFile")
         .option("pathGlobFilter", "*.xls*")
         .load(LANDING_VOLUME_PATH)
+        # ============ ADDING INCREMENTAL DOWNLOAD CHECK ============
+        # Cloud storage last-modified time, captured immediately after the
+        # read (before select/explode, since _metadata may not resolve
+        # reliably several transforms later).
+        .withColumn("_file_modified_at", F.col("_metadata.file_modification_time"))
+        # ============================================================
     )
 
     parsed = raw.withColumn("_parsed", _parse_udf(F.col("content")))
     exploded = parsed.select(
-        "path", F.explode(F.col("_parsed.partners")).alias("_p")
+        "path",
+        "_file_modified_at",  # ADDING INCREMENTAL DOWNLOAD CHECK
+        F.explode(F.col("_parsed.partners")).alias("_p"),
     )
 
     return (
@@ -281,9 +291,12 @@ def total_sheet_partners_raw():
             F.col("_p.section_label").alias("section_label"),
             F.col("_p.source_sheet").alias("_source_sheet"),
             F.col("_p.sheet_row_number").alias("_sheet_row_number"),
+            "_file_modified_at",  # ADDING INCREMENTAL DOWNLOAD CHECK
             "path",
         )
         .withColumn("_source_file", _decode_udf(F.col("path")))
+        # ADDING INCREMENTAL DOWNLOAD CHECK
+        .withColumnRenamed("_file_modified_at", "_source_file_modified_at")
         .withColumn(
             "_ingested_at",
             F.date_format(F.current_timestamp(), "yyyy-MM-dd'T'HH:mm:ssXXX"),
@@ -301,7 +314,11 @@ def total_sheet_partners_raw():
         "referencing them. Matching downstream MUST be scoped to the same "
         "_source_file - names can differ between seasons (confirmed: "
         "'British  Sky BC' with two spaces in one file, one space in "
-        "another), so this is never deduplicated across files."
+        "another), so this is never deduplicated across files. "
+        "ADDING INCREMENTAL DOWNLOAD CHECK: filtered to the most recently "
+        "modified source file per (competition, season) - superseded "
+        "uploads for the same season remain in total_sheet_partners_raw as "
+        "history but are excluded here."
     ),
 )
 @dp.expect("has_partner_name", "partner_name IS NOT NULL")
@@ -347,7 +364,7 @@ def total_sheet_partners():
         .drop("_map_label", "_map_file_pattern", "_map_rank")
     )
 
-    return (
+    df = (
         df.withColumn(
             "competition",
             F.regexp_extract(F.col("_source_file"), COMPETITION_PATTERN.pattern, 1),
@@ -365,27 +382,46 @@ def total_sheet_partners():
                 F.col("partner_name"),
             ),
         )
-        .select(
-            "partner_key",
-            "partner_name",
-            "partner_country",
-            "partner_category",
-            "section_label",
-            "responsible",
-            "competition",
-            "season",
-            "sales_contracted",
-            "invoiced",
-            "not_yet_invoiced",
-            "sales_paid",
-            "overdue",
-            "action",
-            "_source_file",
-            "_source_sheet",
-            "_sheet_row_number",
-            "_ingested_at",
-        )
     )
+
+    # ================= ADDING INCREMENTAL DOWNLOAD CHECK =================
+    # Only trust the most recently modified file per (competition, season).
+    # dense_rank (not row_number) is required: every row belonging to the
+    # same source file shares the same _source_file_modified_at value, so
+    # dense_rank correctly keeps ALL of that file's rows, where row_number
+    # would arbitrarily cut the winning file off partway through.
+    latest_file_window = Window.partitionBy("competition", "season").orderBy(
+        F.col("_source_file_modified_at").desc()
+    )
+    df = (
+        df.withColumn("_file_rank", F.dense_rank().over(latest_file_window))
+        .filter(F.col("_file_rank") == 1)
+        .drop("_file_rank")
+    )
+    # =======================================================================
+
+    return df.select(
+        "partner_key",
+        "partner_name",
+        "partner_country",
+        "partner_category",
+        "section_label",
+        "responsible",
+        "competition",
+        "season",
+        "sales_contracted",
+        "invoiced",
+        "not_yet_invoiced",
+        "sales_paid",
+        "overdue",
+        "action",
+        "_source_file",
+        "_source_file_modified_at",  # ADDING INCREMENTAL DOWNLOAD CHECK
+        "_source_sheet",
+        "_sheet_row_number",
+        "_ingested_at",
+    )
+
 ```
 
 ---
