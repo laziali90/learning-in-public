@@ -83,16 +83,15 @@ WHERE NOT EXISTS (
 
 #### A) Creation
 
-**Purpose:** Decision-support query for a human curating umcc_partners
+**Purpose:** Decision-support query for a human curating umcc_partners.
+
+- Generated via a one-time `CREATE OR REFRESH TABLE ... AS` SQL statement, not a pipeline table
 - Not part of the pipeline's runtime logic — its output is meant to be eyeballed, not consumed by any downstream table.
 
-Logic
+**Logic**
 1) Inventory — every distinct (partner, partner_category) pair actually seen in bronze.payment, with season/country context pulled in from total_sheet_partners (correctly scoped to _source_file, matching the drift/collision caveats already documented in the bronze layer) purely as reference to help a human judge whether two names are the same entity.
-
 2) Whitespace/formatting duplicates — normalizes each name (trim, collapse spaces, lowercase) and surfaces any raw value that maps to more than one literal string, catching the easy cases like double spaces or trailing whitespace.
-   
 3) Legitimate multi-category partners — names that genuinely span more than one partner_category (the adidas-as-sponsor/supplier/licensee kind of case already known from the bronze brief), flagged so they're deliberately kept as separate dimension rows rather than mistakenly collapsed into one.
-   
 4) Fuzzy near-duplicates — pairs of names within the same category that are either a prefix of each other or within edit-distance 3 (the "HRT" vs "HRT TV" case), shown side-by-side with their country variants so a human can judge same-partner-different-spelling vs. genuinely-different-partner-that-looks-similar.
 
 ```sql
@@ -165,9 +164,12 @@ JOIN partner_summary AS b
     )
 ORDER BY a.partner_category, a.partner;
 ```
----
-
 #### B) Add values
+
+**Purpose:** Adding mapped umcc_partners lookup values.
+
+- Generated via a one-time `CREATE OR REFRESH TABLE ... AS` SQL statement, not a pipeline table
+- Not part of the pipeline's runtime logic — its output is meant to be eyeballed, not consumed by any downstream table.
 
 ```sql
 
