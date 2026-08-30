@@ -1104,8 +1104,6 @@ Purpose: business-renamed, analysis-ready payment table with payment-timeliness 
 - Deliberately two distinct names (`Payment_Diligence_Invoice` / `Payment_Diligence_Season`), not case-variants of the same string - Spark columns are case-preserving but not case-sensitive by default, so names differing only by case risk ambiguous-reference errors downstream.
 
 ```python
-"""Gold transformation: team.gold.payment"""
-
 import pyspark.pipelines as dp
 from pyspark.sql import functions as F
 from pyspark.sql.window import Window
