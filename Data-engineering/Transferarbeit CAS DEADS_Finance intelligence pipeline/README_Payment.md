@@ -1086,18 +1086,21 @@ def umcc_partners_quality_check():
 
 ## III) Business readiness (SILVER → GOLD) `payment` (Materialized View)
 
-Purpose: business-renamed, analysis-ready payment table with payment-timeliness scoring, per invoice and per partner-season.
+**Purpose**: business-renamed, analysis-ready payment table with payment-timeliness scoring, per invoice and per partner-season. Rows with no resolvable partner are dropped here - this is the one place in the whole pipeline that drops rows on a quality check, rather than warning.
 
 - Reads `team.silver.payment` fully-qualified. Same pipeline, cross-schema target - per Databricks' own guidance this is the correct/recommended form for a dataset outside the pipeline's default schema, and registers a normal dependency edge (confirmed via the pipeline graph: silver -> gold shows connected, same as bronze -> silver).
+- **`has_partner` expectation uses `expect_or_drop`, not `expect`.** Every other quality check in this pipeline (bronze's `has_partner`, silver's `has_partner_cleaned`, `umcc_partners_quality_check`) is deliberately warn-only - nothing gets dropped anywhere else on the strength of a check. This is the one intentional exception: by the time a row reaches gold, it has already passed through three independent upstream checks confirming partner resolution, so a `Partner IS NULL` row here is either the confirmed UEL 13-14 source-data gap or a genuinely unmapped partner - either way, not usable for analysis, and not worth carrying downstream into dashboards.
+**Consequence: gold's row count no longer matches silver's 1:1.** Worth remembering if reconciling row counts across layers later.
+
 - Drops `partner` (raw) - only `partner_cleaned` is carried forward, renamed to `Partner`.
 - Drops `sales_paid_eur` - not needed at this layer.
 - Business renames (see `RENAMES` dict): `_season_from_filename` -> `Season`, `partner_cleaned` -> `Partner`, `partner_category` -> `Partner_Category`, `invoiced_original` -> `Invoiced_date`, `due_on` -> `Invoice_due_date`, `receipt_of_payment` -> `Payment_received_date`, `sales_contracted_eur` -> `Rights_fee`. Everything else (`competition`, `invoice_number`, `invoiced_eur`, `_source_file`, `_ingested_at`) is left as-is.
 - Underscores, not spaces, in the renamed columns - Delta rejects spaces in column names by default (`DELTA_INVALID_CHARACTERS_IN_COLUMN_NAMES`) unless column mapping is enabled on the table. Decided against enabling column mapping; space-friendly labels are applied at the dashboard/BI layer instead, not stored as physical column names.
+- Enriched with `cycle` from `team.dim.umccseasoncycle`, joined on `Season`. The join relies on Spark's default case-insensitive column resolution (`Season` on this side matching `season` on the dim side) rather than an explicit alias - works under default Spark settings, but would break if case-sensitive resolution were ever turned on for this workspace.
 - `Payment_received_in_days` = `Payment_received_date` minus `Invoice_due_date`. Positive = paid late, negative = paid early.
 - `Payment_Diligence_Invoice` (per-row): `NULL` if `Payment_received_date` is null (no assessment made, not treated as Slow by omission); `Prompt Payer` if received within 30 days of due date; `Slow Payer` otherwise.
 - `Payment_Diligence_Season` (per `Partner` + `Season`, majority vote): counts `Prompt Payer` vs `Slow Payer` invoices within the group, using a `Window.partitionBy("Partner", "Season")` - rows with a null `Payment_Diligence_Invoice` don't count toward either side. Whichever has more wins; a tie defaults to `Slow Payer` (conservative default, deliberate choice); a group with zero assessable invoices gets `NULL`.
 - Deliberately two distinct names (`Payment_Diligence_Invoice` / `Payment_Diligence_Season`), not case-variants of the same string - Spark columns are case-preserving but not case-sensitive by default, so names differing only by case risk ambiguous-reference errors downstream.
-- No `dp.expect` on this table. The meaningful data-quality checks (invoice present, partner resolved) already run in silver; gold introduces no new raw data, only renames and derives from what silver already validated.
 
 ```python
 """Gold transformation: team.gold.payment"""
@@ -1123,9 +1126,11 @@ RENAMES = {
     name="team.gold.payment",
     comment=(
         "Gold: business-renamed, analysis-ready payment table with "
-        "per-invoice and per-partner-season payment diligence."
+        "per-invoice and per-partner-season payment diligence. Rows with "
+        "no resolved Partner are dropped (see has_partner expectation)."
     ),
 )
+@dp.expect_or_drop("has_partner", "Partner IS NOT NULL")
 def payment():
     df = spark.read.table("team.silver.payment")
 
@@ -1134,7 +1139,7 @@ def payment():
     for old, new in RENAMES.items():
         df = df.withColumnRenamed(old, new)
 
-  # Enrich with UMCC season-cycle reference data. Single-name join on
+    # Enrich with UMCC season-cycle reference data. Single-name join on
     # "Season" relies on Spark's case-insensitive column resolution to
     # match against the dim's "season" column with no duplicate key column.
     season_cycle = spark.read.table("team.dim.umccseasoncycle").select("season", "cycle")
@@ -1170,6 +1175,9 @@ def payment():
         .when(prompt_count > slow_count, F.lit("Prompt Payer"))
         .otherwise(F.lit("Slow Payer")),  # covers both real Slow majority and ties
     )
+
+    return df
+```
 
     return df
 ```
