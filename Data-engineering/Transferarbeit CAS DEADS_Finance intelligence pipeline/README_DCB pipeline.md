@@ -240,7 +240,7 @@ from pyspark.sql.functions import col
 
 @dp.table(
     name="team.silver.dcb",
-    comment="DCB harmonized to relevant budget columns, enriched with season-cycle mapping from team.dim.seasoncycle.",
+    comment="DCB harmonized to relevant budget columns, enriched with season-cycle mapping from team.dim.UMCCseasoncycle.",
     table_properties={"quality": "silver"}
 )
 @dp.expect("valid_cycle", "cycle IS NOT NULL")
