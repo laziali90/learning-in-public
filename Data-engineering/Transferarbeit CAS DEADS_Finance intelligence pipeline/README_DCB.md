@@ -11,7 +11,6 @@ Lakeflow Declarative Pipeline covering Landing → Bronze → Silver → Gold fo
 - **Bronze schema:** `team.bronze`
 - **Silver schema:** `team.silver`
 - **Gold schema:** `team.gold`
-- **Dimension schema:** `team.dim`
 - **Orchestration:** single Lakeflow Declarative Pipeline (Python, `pyspark.pipelines` / `dp` API), run on-demand; full DAG (`dcb_raw` → `dcb` → `team.silver.dcb` → `team.gold.dcb`) executes on every run, with streaming/materialized-view engines each determining incremental vs. full recompute internally.
 
 ---
@@ -398,13 +397,3 @@ Compares the total unfiltered row count in dcb_raw against the filtered, forward
 SELECT COUNT(*) FROM team.bronze.dcb_raw;   -- unfiltered total
 SELECT COUNT(*) FROM team.bronze.dcb;      
 ```
-
----
-
-
-## Key Technical Decisions / Gotchas
-
-- **Two-stage bronze split (`dcb_raw` / `dcb`)** exists specifically because streaming DataFrames cannot use row-order-dependent window functions or `monotonically_increasing_id()`; any row-order logic must run in a batch stage reading from a streaming table, not inside the streaming table itself.
-- **Schema/checkpoint cache invalidation:** `cloudFiles.schemaLocation` and the Auto Loader checkpoint persist across runs and must be manually cleared (`dbutils.fs.rm(..., recurse=True)`) plus the target tables dropped (`DROP TABLE IF EXISTS`) whenever the source extraction range, header handling, or column count changes — a full pipeline refresh alone does not guarantee this is reset.
-- **Excel header text is not trusted** as a schema source anywhere in this pipeline — headers are inconsistent across files (spacing, apostrophes, casing) and would otherwise fragment into spurious duplicate columns; all naming is positional against a manually verified column list.
-- **File paths from `_metadata.file_path` are URL-encoded** (e.g. spaces → `%20`); any filename-parsing logic must decode first.
