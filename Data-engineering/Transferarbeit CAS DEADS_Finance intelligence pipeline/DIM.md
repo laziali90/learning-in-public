@@ -1,4 +1,6 @@
-## `team.dim.umccseasoncycle` — Dimension Table (SQL, static)
+## Dimension tables
+
+### `team.dim.umccseasoncycle` (SQL, static)
 
 **Purpose:** maps every UMCC football season to its 3-season reporting cycle.
 
@@ -39,3 +41,7 @@ ORDER BY start_year;
 
 ```
 ---
+
+### XXX
+
+
