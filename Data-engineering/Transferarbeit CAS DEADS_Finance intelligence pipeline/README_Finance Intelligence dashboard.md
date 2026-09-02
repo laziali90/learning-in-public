@@ -1,9 +1,10 @@
 # TEAM UMCC Finance Intelligence Dashboard
 
-## Overview
+## Summary
 
-A multi-view dashboard for financial analysis of UEFA Club Competitions, providing insights into partner rights fees, payment diligence, and competition budget management. Built on two independent data pipelines feeding distinct analytical views.
+**Overview:** A multi-view dashboard for financial analysis of UEFA Club Competitions, providing insights into partner rights fees, payment diligence, and competition budget management. Built on two independent data pipelines feeding distinct analytical views.
 
+**Tool:** Integrated BI / Dashboard solution in Databricks Workspace
 ---
 
 ## View 1: Payment & Rights Fees
