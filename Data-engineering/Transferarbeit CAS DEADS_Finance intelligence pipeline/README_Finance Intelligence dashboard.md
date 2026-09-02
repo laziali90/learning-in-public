@@ -54,7 +54,7 @@ A multi-view dashboard for financial analysis of UEFA Club Competitions, providi
 
 ---
 
-## View 2: DCB (Direct Competition Budget)
+## View 2: DCB
 
 ### Data Source
 **Pipeline:** `team.gold.dcb`  
