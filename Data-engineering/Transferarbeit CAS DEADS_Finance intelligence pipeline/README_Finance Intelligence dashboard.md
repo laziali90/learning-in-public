@@ -5,12 +5,13 @@
 **Overview:** A multi-view dashboard for financial analysis of UEFA Club Competitions, providing insights into partner rights fees, payment diligence, and competition budget management. Built on two independent data pipelines feeding distinct analytical views.
 
 **Tool:** Integrated BI / Dashboard solution in Databricks Workspace
+
 ---
 
 ## View 1: Payment & Rights Fees
 
 ### Data Source
-**Pipeline:** `team.gold.payment`  
+**Data:** `team.gold.payment`  
 **Dataset Type:** Local Metric View
 
 ### Ingested Fields (Dimensions)
@@ -58,7 +59,7 @@
 ## View 2: DCB
 
 ### Data Source
-**Pipeline:** `team.gold.dcb`  
+**Data:** `team.gold.dcb`  
 **Dataset Type:** Local Metric View
 
 ### Ingested Fields (Dimensions)
